@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, SkillPickerView};
+use crate::app::{App, HistoryPickerView, MenuTab, SkillPickerView};
 use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
 use crate::model::{
     ComposeTarget, ComposerToken, ComposerTokenKind, MessageEntry, MessageKind, PreviewVerbosity,
@@ -19,7 +19,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
     if app.settings_open() {
-        render_settings(frame, area, app.settings_selection());
+        render_menu(
+            frame,
+            area,
+            app.menu_tab(),
+            app.settings_selection(),
+            app.history_picker_view().as_ref(),
+        );
         return;
     }
 
@@ -122,7 +128,62 @@ fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerVi
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-fn render_settings(frame: &mut Frame<'_>, area: Rect, selected: PreviewVerbosity) {
+fn render_menu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    tab: MenuTab,
+    selected: PreviewVerbosity,
+    history: Option<&HistoryPickerView>,
+) {
+    let panel = if area.height > 4 {
+        Rect::new(area.x, area.y + 1, area.width, area.height - 2)
+    } else {
+        area
+    };
+    let mut lines = vec![menu_tabs(tab), Line::default()];
+    match tab {
+        MenuTab::Settings => render_settings_tab(frame, panel, selected, &mut lines),
+        MenuTab::All => render_all_tab(frame, panel, history, &mut lines),
+    }
+}
+
+fn menu_tabs(selected: MenuTab) -> Line<'static> {
+    let active = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(Color::DarkGray);
+    Line::from(vec![
+        Span::styled(
+            "Codex Deck  ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "Settings",
+            if selected == MenuTab::Settings {
+                active
+            } else {
+                inactive
+            },
+        ),
+        Span::styled("  ", inactive),
+        Span::styled(
+            "All",
+            if selected == MenuTab::All {
+                active
+            } else {
+                inactive
+            },
+        ),
+        Span::styled("   Tab switch", inactive),
+    ])
+}
+
+fn render_settings_tab(
+    frame: &mut Frame<'_>,
+    panel: Rect,
+    selected: PreviewVerbosity,
+    lines: &mut Vec<Line<'static>>,
+) {
     let options = [
         (
             PreviewVerbosity::Full,
@@ -143,26 +204,10 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, selected: PreviewVerbosity
             "final replies only",
         ),
     ];
-    let panel_height = 9u16.min(area.height);
-    let panel = Rect::new(
-        area.x,
-        area.y + area.height.saturating_sub(panel_height) / 2,
-        area.width,
-        panel_height,
-    );
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Codex Deck Settings",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::default(),
-        Line::from(Span::styled(
-            "Preview verbosity",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-    ];
+    lines.push(Line::from(Span::styled(
+        "Preview verbosity",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     let selected_index = options
         .iter()
         .position(|(verbosity, _, _, _)| *verbosity == selected)
@@ -183,17 +228,79 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, selected: PreviewVerbosity
             Span::styled(description, Style::default().fg(Color::DarkGray)),
         ]));
     }
-    lines.push(Line::default());
+    while lines.len() + 1 < panel.height as usize {
+        lines.push(Line::default());
+    }
     lines.push(Line::from(Span::styled(
-        "↑↓ select · Enter save · ←← cancel · Ctrl+C close Deck",
+        "↑↓ select · Enter save · Tab switch · ←← close · Ctrl+C close Deck",
         Style::default().fg(Color::DarkGray),
     )));
-    frame.render_widget(Paragraph::new(Text::from(lines)), panel);
+    frame.render_widget(Paragraph::new(Text::from(lines.clone())), panel);
 
     let cursor_y = panel.y.saturating_add(3 + selected_index as u16);
     if cursor_y < panel.bottom() {
         frame.set_cursor_position((panel.x.min(panel.right().saturating_sub(1)), cursor_y));
     }
+}
+
+fn render_all_tab(
+    frame: &mut Frame<'_>,
+    panel: Rect,
+    history: Option<&HistoryPickerView>,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let query = history.map(|view| view.query.as_str()).unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Find › ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(query.to_string()),
+    ]));
+    lines.push(Line::default());
+
+    let items = history
+        .map(|view| view.items.as_slice())
+        .unwrap_or_default();
+    let selected = history.map(|view| view.selected).unwrap_or_default();
+    let viewport = panel.height.saturating_sub(5) as usize;
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if query.is_empty() {
+                "  No sessions outside the Deck"
+            } else {
+                "  No matching sessions"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let offset = selected.saturating_add(1).saturating_sub(viewport.max(1));
+        lines.extend(items.iter().enumerate().skip(offset).take(viewport).map(
+            |(index, session)| session_line(session, index == selected, panel.width as usize),
+        ));
+    }
+    while lines.len() + 1 < panel.height as usize {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        "type to filter · ↑↓ select · Enter add · Tab switch · ←← close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines.clone())), panel);
+
+    let prefix_width = UnicodeWidthStr::width("Find › ");
+    let query_width = UnicodeWidthStr::width(query);
+    let cursor_x = panel
+        .x
+        .saturating_add((prefix_width + query_width) as u16)
+        .min(panel.right().saturating_sub(1));
+    let cursor_y = panel
+        .y
+        .saturating_add(2)
+        .min(panel.bottom().saturating_sub(1));
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 fn render_separator(frame: &mut Frame<'_>, area: Rect) {
@@ -507,7 +614,7 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
 }
 
 fn composer_hint(app: &App) -> String {
-    let base = "$ skills · ←← settings · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
+    let base = "$ skills · ←← menu · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X pause/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {

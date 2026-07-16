@@ -113,6 +113,25 @@ struct SkillPicker {
     selected: usize,
 }
 
+#[derive(Debug, Clone)]
+struct HistoryPicker {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryPickerView {
+    pub query: String,
+    pub selected: usize,
+    pub items: Vec<Session>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuTab {
+    Settings,
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CtrlXAction {
     Pause,
@@ -142,6 +161,8 @@ pub struct App {
     composer: Composer,
     new_draft: Composer,
     reply_drafts: HashMap<String, Composer>,
+    history_sessions: Vec<Session>,
+    history_picker: Option<HistoryPicker>,
     skills_by_cwd: HashMap<String, Vec<SkillMetadata>>,
     skills_inflight: BTreeSet<String>,
     skill_picker: Option<SkillPicker>,
@@ -160,6 +181,7 @@ pub struct App {
     attach_requested: Option<AttachRequest>,
     attach_right_armed: bool,
     settings_open: bool,
+    menu_tab: MenuTab,
     settings_selection: PreviewVerbosity,
     settings_left_armed: bool,
     ctrl_x_armed: Option<CtrlXConfirmation>,
@@ -188,6 +210,8 @@ impl App {
             composer: Composer::default(),
             new_draft: Composer::default(),
             reply_drafts: HashMap::new(),
+            history_sessions: Vec::new(),
+            history_picker: None,
             skills_by_cwd: HashMap::new(),
             skills_inflight: BTreeSet::new(),
             skill_picker: None,
@@ -206,6 +230,7 @@ impl App {
             attach_requested: None,
             attach_right_armed: false,
             settings_open: false,
+            menu_tab: MenuTab::Settings,
             settings_selection,
             settings_left_armed: false,
             ctrl_x_armed: None,
@@ -277,7 +302,7 @@ impl App {
         }
 
         if self.settings_open {
-            return self.handle_settings_key(key);
+            return self.handle_settings_key(key, sender);
         }
 
         if self.handle_skill_picker_key(key) {
@@ -405,6 +430,12 @@ impl App {
 
     pub fn insert_paste(&mut self, text: &str) {
         if self.settings_open {
+            if self.menu_tab == MenuTab::All
+                && let Some(picker) = &mut self.history_picker
+            {
+                picker.query.push_str(text);
+                picker.selected = 0;
+            }
             return;
         }
         self.skill_picker = None;
@@ -544,6 +575,10 @@ impl App {
         self.settings_selection
     }
 
+    pub fn menu_tab(&self) -> MenuTab {
+        self.menu_tab
+    }
+
     pub fn skill_picker_view(&self) -> Option<SkillPickerView> {
         let picker = self.skill_picker.as_ref()?;
         let items = self
@@ -557,6 +592,24 @@ impl App {
         Some(SkillPickerView {
             selected: picker.selected.min(items.len().saturating_sub(1)),
             loading: self.skills_inflight.contains(&picker.cwd),
+            items,
+        })
+    }
+
+    pub fn history_picker_view(&self) -> Option<HistoryPickerView> {
+        if !self.settings_open || self.menu_tab != MenuTab::All {
+            return None;
+        }
+        let picker = self.history_picker.as_ref()?;
+        let items = self
+            .history_sessions
+            .iter()
+            .filter(|session| history_session_matches(session, &picker.query))
+            .cloned()
+            .collect::<Vec<_>>();
+        Some(HistoryPickerView {
+            query: picker.query.clone(),
+            selected: picker.selected.min(items.len().saturating_sub(1)),
             items,
         })
     }
@@ -790,6 +843,8 @@ impl App {
                     let was_selected = self.selected_session().map(|session| session.id.as_str())
                         == Some(thread_id);
                     self.sessions.retain(|session| session.id != thread_id);
+                    self.history_sessions
+                        .retain(|session| session.id != thread_id);
                     self.lifecycle.dismiss(thread_id);
                     self.lifecycle.save().context("save session lifecycle")?;
                     self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
@@ -1232,11 +1287,14 @@ impl App {
             for thread in threads {
                 if let Some(session) = Session::from_thread(thread) {
                     self.initial_scan_seen.insert(session.id.clone());
-                    if self.should_track(&session) {
+                    let should_track = self.should_track(&session);
+                    if should_track {
                         self.lifecycle.track(session.id.clone());
                     }
-                    if self.should_include(&session) {
+                    if self.show_all || should_track {
                         self.merge_session(session);
+                    } else {
+                        self.merge_history_session(session);
                     }
                 }
             }
@@ -1248,6 +1306,8 @@ impl App {
     }
 
     fn merge_session(&mut self, incoming: Session) {
+        self.history_sessions
+            .retain(|session| session.id != incoming.id);
         if let Some(existing) = self.session_mut(&incoming.id) {
             let completed_transition = existing.status.is_live() && !incoming.status.is_live();
             existing.title = incoming.title;
@@ -1265,6 +1325,23 @@ impl App {
             self.sessions.push(incoming);
         }
         self.sort_sessions_preserving_selection();
+    }
+
+    fn merge_history_session(&mut self, mut incoming: Session) {
+        incoming.messages.clear();
+        incoming.active_turn_id = None;
+        incoming.history_loaded = false;
+        if let Some(existing) = self
+            .history_sessions
+            .iter_mut()
+            .find(|session| session.id == incoming.id)
+        {
+            *existing = incoming;
+        } else {
+            self.history_sessions.push(incoming);
+        }
+        self.history_sessions
+            .sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     }
 
     fn apply_thread_history(&mut self, thread_id: &str, thread: &Value) {
@@ -1521,6 +1598,11 @@ impl App {
             self.settings_left_armed = false;
             self.attach_right_armed = false;
             self.settings_selection = self.lifecycle.preview_verbosity();
+            self.menu_tab = MenuTab::Settings;
+            self.history_picker = Some(HistoryPicker {
+                query: String::new(),
+                selected: 0,
+            });
             self.settings_open = true;
             self.notice.clear();
         } else {
@@ -1687,13 +1769,42 @@ impl App {
         Ok(())
     }
 
-    fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_settings_key(&mut self, key: KeyEvent, sender: &mut impl RpcSender) -> Result<()> {
         let settings_left = key.code == KeyCode::Left
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !settings_left {
             self.settings_left_armed = false;
+        }
+
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.menu_tab = match self.menu_tab {
+                MenuTab::Settings => MenuTab::All,
+                MenuTab::All => MenuTab::Settings,
+            };
+            self.settings_left_armed = false;
+            return Ok(());
+        }
+
+        if settings_left && key.kind == KeyEventKind::Repeat {
+            return Ok(());
+        }
+        if settings_left && self.settings_left_armed {
+            self.settings_open = false;
+            self.settings_left_armed = false;
+            self.history_picker = None;
+            self.settings_selection = self.lifecycle.preview_verbosity();
+            self.notice = "Menu closed".to_string();
+            return Ok(());
+        }
+        if settings_left {
+            self.settings_left_armed = true;
+            return Ok(());
+        }
+
+        if self.menu_tab == MenuTab::All {
+            return self.handle_all_tab_key(key, sender);
         }
 
         match key.code {
@@ -1717,24 +1828,90 @@ impl App {
                 self.lifecycle.save().context("save deck settings")?;
                 self.settings_open = false;
                 self.settings_left_armed = false;
+                self.history_picker = None;
                 self.scroll_back = 0;
                 self.notice = format!(
                     "Preview verbosity: {}",
                     preview_verbosity_name(self.settings_selection)
                 );
             }
-            KeyCode::Left if settings_left && key.kind == KeyEventKind::Repeat => {}
-            KeyCode::Left if settings_left && self.settings_left_armed => {
-                self.settings_open = false;
-                self.settings_left_armed = false;
-                self.settings_selection = self.lifecycle.preview_verbosity();
-                self.notice = "Settings unchanged".to_string();
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_all_tab_key(&mut self, key: KeyEvent, sender: &mut impl RpcSender) -> Result<()> {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.history_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
             }
-            KeyCode::Left if settings_left => {
-                self.settings_left_armed = true;
+            KeyCode::Down => {
+                let item_count = self
+                    .history_picker_view()
+                    .map(|view| view.items.len())
+                    .unwrap_or_default();
+                if let Some(picker) = &mut self.history_picker {
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(1)
+                        .min(item_count.saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => self.add_selected_history_session(sender)?,
+            KeyCode::Backspace => {
+                if let Some(picker) = &mut self.history_picker {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(picker) = &mut self.history_picker {
+                    picker.query.clear();
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                if let Some(picker) = &mut self.history_picker {
+                    picker.query.push(character);
+                    picker.selected = 0;
+                }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn add_selected_history_session(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        let Some(session) = self
+            .history_picker_view()
+            .and_then(|view| view.items.get(view.selected).cloned())
+        else {
+            self.notice = "No matching session to add".to_string();
+            return Ok(());
+        };
+        let thread_id = session.id.clone();
+        let title = session.title.clone();
+        if self.composer.target == ComposeTarget::Rename {
+            self.cancel_rename();
+        } else {
+            self.cache_current_draft();
+        }
+        self.track_session(&thread_id)?;
+        self.merge_session(session);
+        self.select_session(&thread_id);
+        self.load_reply_draft(&thread_id);
+        self.settings_open = false;
+        self.settings_left_armed = false;
+        self.history_picker = None;
+        self.scroll_back = 0;
+        self.ensure_selected_history(sender)?;
+        self.notice = format!("Added {title} · type a reply and press Enter to resume");
         Ok(())
     }
 
@@ -1837,10 +2014,6 @@ impl App {
                 && session.thread_source.as_deref() == Some(THREAD_SOURCE))
     }
 
-    fn should_include(&self, session: &Session) -> bool {
-        self.show_all || self.should_track(session)
-    }
-
     fn track_session(&mut self, thread_id: &str) -> Result<()> {
         if !self.lifecycle.is_initialized() {
             self.initial_scan_seen.insert(thread_id.to_string());
@@ -1893,12 +2066,14 @@ impl App {
             self.notice = "Pausing session…".to_string();
             return Ok(());
         }
+        let removed_session = session.clone();
         let thread_id = session.id.clone();
         let was_selected =
             self.selected_session().map(|session| session.id.as_str()) == Some(thread_id.as_str());
         self.lifecycle.dismiss(&thread_id);
         self.lifecycle.save().context("save session lifecycle")?;
         self.sessions.retain(|session| session.id != thread_id);
+        self.merge_history_session(removed_session);
         self.pending_requests
             .retain(|request| request.thread_id != thread_id);
         self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
@@ -2068,6 +2243,15 @@ fn skill_matches(skill: &SkillMetadata, query: &str) -> bool {
     let query = query.to_ascii_lowercase();
     skill.name.to_ascii_lowercase().contains(&query)
         || skill.description.to_ascii_lowercase().contains(&query)
+}
+
+fn history_session_matches(session: &Session, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || session.title.to_lowercase().contains(&query)
+        || session.cwd.to_lowercase().contains(&query)
+        || session.preview.to_lowercase().contains(&query)
+        || session.id.to_lowercase().contains(&query)
 }
 
 fn skills_from_list_response(result: &Value) -> Vec<SkillMetadata> {
@@ -2736,6 +2920,69 @@ mod tests {
     }
 
     #[test]
+    fn all_menu_adds_a_history_session_then_resumes_it_in_the_deck() {
+        let (mut app, state_path) = test_app(false);
+        app.merge_history_session(test_session(
+            "history-thread",
+            "Legacy research",
+            SessionStatus::Completed,
+        ));
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("first left");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("open menu");
+        assert_eq!(app.menu_tab(), MenuTab::Settings);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
+            .expect("switch to all");
+        assert_eq!(app.menu_tab(), MenuTab::All);
+        assert_eq!(app.history_picker_view().expect("all tab").items.len(), 1);
+        for character in "research".chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut sender,
+            )
+            .expect("filter history");
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("add history session");
+
+        assert!(!app.settings_open());
+        assert_eq!(
+            app.selected_session().expect("added session").id,
+            "history-thread"
+        );
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert!(app.lifecycle.contains("history-thread"));
+        assert!(app.history_sessions.is_empty());
+
+        app.insert_text("Continue this work");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("resume inside deck");
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/resume".to_string(),
+                json!({"threadId":"history-thread"})
+            ))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn left_arrow_keeps_editing_nonempty_composer() {
         let (mut app, state_path) = test_app(true);
         let mut sender = test_sender();
@@ -2998,6 +3245,8 @@ mod tests {
 
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.sessions[0].id, "live-thread");
+        assert_eq!(app.history_sessions.len(), 1);
+        assert_eq!(app.history_sessions[0].id, "old-thread");
         assert!(app.lifecycle.contains("live-thread"));
         assert!(!app.lifecycle.contains("old-thread"));
         let _ = std::fs::remove_file(state_path);
@@ -3034,6 +3283,7 @@ mod tests {
         .expect("confirm removal");
 
         assert!(app.sessions.is_empty());
+        assert_eq!(app.history_sessions[0].id, "review-thread");
         assert!(!app.lifecycle.contains("review-thread"));
         assert!(app.notice.contains("Codex history was kept"));
         std::fs::remove_file(state_path).expect("remove lifecycle state");

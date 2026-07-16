@@ -33,12 +33,9 @@ By default, the deck is a managed lifecycle rather than a history browser. It
 automatically adopts sessions started by the deck and currently active sessions
 from other Codex clients. Completed sessions remain until you review and dismiss
 them. The list is grouped as `Pinned`, `Working`, and `Completed`; pinned sessions
-stay in the first group regardless of their current runtime status. Browse every
-unarchived local Codex session explicitly with:
-
-```bash
-codex-deck --all
-```
+stay in the first group regardless of their current runtime status. Historical
+sessions outside the Deck are available from the built-in `All` menu tab, so
+resuming old work does not require leaving the dashboard or adding CLI flags.
 
 Check daemon connectivity without opening the TUI:
 
@@ -49,8 +46,13 @@ codex-deck --check
 ## Keys
 
 - `Up` / `Down`: select a session
-- `Left`, twice consecutively: open Settings when the composer is empty;
-  choose preview verbosity with `Up` / `Down` and save with `Enter`
+- `Left`, twice consecutively: open the menu when the composer is empty;
+  use `Tab` to switch between `Settings` and `All`
+- In `Settings`: choose preview verbosity with `Up` / `Down` and save with
+  `Enter`
+- In `All`: type to filter historical sessions, choose with `Up` / `Down`, and
+  press `Enter` to add one to the Deck; the composer switches to Reply so the
+  next message resumes it in the background
 - `Right`, twice consecutively: attach the selected session in the native Codex
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
@@ -100,10 +102,10 @@ distinct ANSI styles. Absolute local paths plus `http`, `https`, `file`, and
 `mailto` Markdown targets are emitted as OSC 8 hyperlinks without exposing the
 target in the visible text.
 
-Settings offers three persistent preview levels: `🧠 Full` shows thinking,
+The Settings tab offers three persistent preview levels: `🧠 Full` shows thinking,
 progress, and final replies; `💬 Progress` hides thinking; `✅ Final` shows only
 final replies. User prompts, questions, and system errors remain visible at
-every level. Press `Left` twice again to leave Settings without saving.
+every level. Press `Left` twice again to close the menu without saving.
 
 When Codex requests approval, reply with `y` (once), `a` (session), or `n`.
 When Codex asks several questions, separate answers with `|`.
@@ -113,8 +115,8 @@ When Codex asks several questions, separate answers with `|`.
 The lifecycle registry is stored in `~/.codex-deck/lifecycle.json`. It contains
 tracked and pinned thread IDs. Removing a session updates this registry without
 deleting, archiving, or modifying the underlying Codex thread. A removed thread
-is automatically adopted again if it becomes active later. Use `--all` when you
-need the old full-history view.
+is available immediately in the `All` tab and is automatically adopted again if
+it becomes active elsewhere later.
 
 The dashboard does not inspect terminal processes or SQLite. A bounded rollout
 tail is used only for oversized transcript previews, never to infer runtime
