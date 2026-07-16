@@ -49,8 +49,8 @@ codex-deck --check
 ## Keys
 
 - `Up` / `Down`: select a session
-- `Enter` / `Right`: attach the selected session in the native Codex TUI when
-  the composer is empty
+- `Right`, twice consecutively: attach the selected session in the native Codex
+  TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
 - `Ctrl+N`: compose a new task
 - `Ctrl+T`: pin or unpin the selected session
@@ -63,7 +63,7 @@ codex-deck --check
 
 While attached, use native Codex normally. Run `/exit` to return to the deck;
 the dashboard reconnects to the same app-server and refreshes the transcript.
-Sessions with large rollout files use a bounded 4 MiB tail preview instead of
+Sessions with large rollout files use a bounded 64 MiB tail preview instead of
 requesting the full transcript, so one oversized history cannot disconnect the
 dashboard.
 

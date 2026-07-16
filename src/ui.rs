@@ -16,8 +16,18 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    let input_height = area.height.min(2);
     let separator_height = u16::from(area.height >= 6);
+    let max_input_height = area
+        .height
+        .saturating_sub(separator_height.saturating_mul(2))
+        .saturating_sub(2)
+        .max(1);
+    let input_height = composer_height(
+        composer_prefix(app.composer().target, app.selected_has_pending_request()),
+        &app.composer().text,
+        area.width as usize,
+        max_input_height,
+    );
     let available = area
         .height
         .saturating_sub(input_height)
@@ -60,9 +70,9 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let selected = app.selected_index();
     let groups = [
-        (SessionGroup::Pinned, "Pinned", Color::Magenta),
+        (SessionGroup::Pinned, "Pinned", Color::Green),
         (SessionGroup::Working, "Working", Color::Green),
-        (SessionGroup::Completed, "Completed", Color::Cyan),
+        (SessionGroup::Completed, "Completed", Color::Green),
     ];
     let mut rows = Vec::with_capacity(app.sessions().len() + groups.len());
     for (group, label, color) in groups {
@@ -283,12 +293,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let pending = app.selected_has_pending_request();
-    let prefix = match app.composer().target {
-        ComposeTarget::NewTask => "＋ new › ",
-        ComposeTarget::Reply if pending => "？ answer › ",
-        ComposeTarget::Reply => "↳ reply › ",
-        ComposeTarget::Rename => "✎ rename › ",
-    };
+    let prefix = composer_prefix(app.composer().target, pending);
     let prefix_style = match app.composer().target {
         ComposeTarget::NewTask => Style::default().fg(Color::Green),
         ComposeTarget::Reply if pending => Style::default().fg(Color::Yellow),
@@ -308,12 +313,13 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let text = all_lines.get(source_row).cloned().unwrap_or_default();
         if source_row == 0 {
             let rest = text.strip_prefix(prefix).unwrap_or(&text).to_string();
-            visible.push(Line::from(vec![
-                Span::styled(prefix.to_string(), prefix_style),
-                Span::raw(rest),
-            ]));
-        } else if text.is_empty() && row == 1 && app.composer().text.is_empty() {
-            visible.push(Line::from(Span::styled(composer_hint(app), dim_style())));
+            let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+            if rest.is_empty() && app.composer().text.is_empty() {
+                spans.push(Span::styled(composer_hint(app), dim_style()));
+            } else {
+                spans.push(Span::raw(rest));
+            }
+            visible.push(Line::from(spans));
         } else {
             visible.push(Line::from(text));
         }
@@ -331,8 +337,24 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
+fn composer_prefix(target: ComposeTarget, pending: bool) -> &'static str {
+    match target {
+        ComposeTarget::NewTask => "＋ new › ",
+        ComposeTarget::Reply if pending => "？ answer › ",
+        ComposeTarget::Reply => "↳ reply › ",
+        ComposeTarget::Rename => "✎ rename › ",
+    }
+}
+
+fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 {
+    let display = format!("{prefix}{text}");
+    let (lines, _, _) = layout_with_cursor(&display, display.len(), width.max(1));
+    (lines.len().min(u16::MAX as usize) as u16).clamp(1, maximum.max(1))
+}
+
 fn composer_hint(app: &App) -> String {
-    let base = "Enter/→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
+    let base =
+        "→→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {
@@ -422,6 +444,13 @@ mod tests {
         assert_eq!(lines[0], "1234");
         assert_eq!(lines[1], "56");
         assert_eq!((row, column), (1, 2));
+    }
+
+    #[test]
+    fn composer_starts_at_one_row_and_grows_with_wrapped_content() {
+        assert_eq!(composer_height("＋ new › ", "", 40, 10), 1);
+        assert_eq!(composer_height("＋ new › ", "1234567890", 10, 10), 2);
+        assert_eq!(composer_height("＋ new › ", "\nsecond\nthird", 40, 2), 2);
     }
 
     #[test]

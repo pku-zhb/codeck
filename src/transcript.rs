@@ -7,10 +7,8 @@ use serde_json::Value;
 use crate::model::{MessageEntry, MessageKind};
 
 pub const FULL_HISTORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
-pub const TAIL_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 256 * 1024;
-const MAX_TEXT_CHARS: usize = 12_000;
-const MAX_MESSAGES: usize = 24;
+pub const TAIL_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECORD_BYTES: usize = TAIL_PREVIEW_BYTES as usize;
 
 pub struct BoundedPreview {
     pub file_bytes: u64,
@@ -26,7 +24,8 @@ pub fn load_bounded_preview_if_large(path: &Path) -> io::Result<Option<BoundedPr
     let start = file_bytes.saturating_sub(TAIL_PREVIEW_BYTES);
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity(TAIL_PREVIEW_BYTES as usize);
+    let read_bytes = file_bytes.saturating_sub(start).min(TAIL_PREVIEW_BYTES);
+    let mut bytes = Vec::with_capacity(read_bytes as usize);
     file.take(TAIL_PREVIEW_BYTES).read_to_end(&mut bytes)?;
     let messages = parse_tail(&bytes, start > 0);
     Ok(Some(BoundedPreview {
@@ -85,7 +84,7 @@ fn is_noisy_record(header: &str) -> bool {
 
 fn parse_event(payload_type: Option<&str>, payload: &Value, messages: &mut Vec<MessageEntry>) {
     match payload_type {
-        Some("task_started") => messages.clear(),
+        Some("task_started") => {}
         Some("user_message") => push_text(
             messages,
             MessageKind::User,
@@ -194,9 +193,6 @@ fn push_text(messages: &mut Vec<MessageEntry>, kind: MessageKind, text: Option<&
         kind,
         text,
     });
-    if messages.len() > MAX_MESSAGES {
-        messages.remove(0);
-    }
 }
 
 fn normalize_text(text: Option<&str>) -> Option<String> {
@@ -209,11 +205,7 @@ fn normalize_text(text: Option<&str>) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    let mut normalized = text.chars().take(MAX_TEXT_CHARS).collect::<String>();
-    if text.chars().count() > MAX_TEXT_CHARS {
-        normalized.push('…');
-    }
-    Some(normalized)
+    Some(text.to_string())
 }
 
 #[cfg(test)]
@@ -227,9 +219,17 @@ mod tests {
     }
 
     #[test]
-    fn bounded_tail_keeps_only_the_latest_user_visible_turn() {
+    fn bounded_tail_keeps_all_user_visible_turns_in_the_window() {
         let data = [
             "partial-record".to_string(),
+            line(
+                "event_msg",
+                json!({ "type": "user_message", "message": "上一轮任务" }),
+            ),
+            line(
+                "event_msg",
+                json!({ "type": "task_complete", "last_agent_message": "上一轮完成" }),
+            ),
             line("event_msg", json!({ "type": "task_started" })),
             line(
                 "response_item",
@@ -255,12 +255,14 @@ mod tests {
         .join("\n");
 
         let messages = parse_tail(data.as_bytes(), true);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].kind, MessageKind::User);
-        assert_eq!(messages[1].kind, MessageKind::Thinking);
-        assert_eq!(messages[2].kind, MessageKind::Progress);
-        assert_eq!(messages[3].kind, MessageKind::Final);
-        assert_eq!(messages[3].text, "已经完成");
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[0].text, "上一轮任务");
+        assert_eq!(messages[1].text, "上一轮完成");
+        assert_eq!(messages[2].kind, MessageKind::User);
+        assert_eq!(messages[3].kind, MessageKind::Thinking);
+        assert_eq!(messages[4].kind, MessageKind::Progress);
+        assert_eq!(messages[5].kind, MessageKind::Final);
+        assert_eq!(messages[5].text, "已经完成");
     }
 
     #[test]
@@ -273,6 +275,29 @@ mod tests {
         let result = load_bounded_preview_if_large(&path).expect("inspect fixture");
         std::fs::remove_file(path).expect("remove fixture");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn bounded_tail_keeps_more_than_the_previous_message_and_text_caps() {
+        assert_eq!(TAIL_PREVIEW_BYTES, 64 * 1024 * 1024);
+        let long_text = "x".repeat(13_000);
+        let mut records = (0..30)
+            .map(|index| {
+                line(
+                    "event_msg",
+                    json!({ "type": "user_message", "message": format!("message-{index}") }),
+                )
+            })
+            .collect::<Vec<_>>();
+        records.push(line(
+            "event_msg",
+            json!({ "type": "agent_message", "message": long_text }),
+        ));
+
+        let messages = parse_tail(records.join("\n").as_bytes(), false);
+
+        assert_eq!(messages.len(), 31);
+        assert_eq!(messages.last().expect("long message").text.len(), 13_000);
     }
 
     #[test]

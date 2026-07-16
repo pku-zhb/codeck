@@ -85,6 +85,7 @@ pub struct App {
     scroll_back: usize,
     message_view_height: usize,
     attach_requested: Option<AttachRequest>,
+    attach_right_armed: bool,
     rename_previous: Option<Composer>,
     rename_thread_id: Option<String>,
 }
@@ -120,6 +121,7 @@ impl App {
             scroll_back: 0,
             message_view_height: 1,
             attach_requested: None,
+            attach_right_armed: false,
             rename_previous: None,
             rename_thread_id: None,
         }
@@ -176,6 +178,16 @@ impl App {
             return Ok(());
         }
 
+        let attach_right = key.code == KeyCode::Right
+            && self.composer.text.is_empty()
+            && self.composer.target != ComposeTarget::Rename
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !attach_right {
+            self.attach_right_armed = false;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -229,17 +241,12 @@ impl App {
             KeyCode::Enter if self.composer.target == ComposeTarget::Rename => {
                 self.submit(sender)?
             }
-            KeyCode::Enter if self.composer.text.is_empty() => self.request_attach()?,
             KeyCode::Enter => self.submit(sender)?,
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right
-                if self.composer.text.is_empty()
-                    && self.composer.target != ComposeTarget::Rename =>
-            {
-                self.request_attach()?
-            }
+            KeyCode::Right if attach_right && key.kind == KeyEventKind::Repeat => {}
+            KeyCode::Right if attach_right => self.confirm_attach()?,
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Home => self.composer.cursor = 0,
             KeyCode::End => self.composer.cursor = self.composer.text.len(),
@@ -256,6 +263,7 @@ impl App {
     }
 
     pub fn insert_text(&mut self, text: &str) {
+        self.attach_right_armed = false;
         self.composer.insert(text);
     }
 
@@ -1169,6 +1177,7 @@ impl App {
     }
 
     fn request_attach(&mut self) -> Result<()> {
+        self.attach_right_armed = false;
         let Some((thread_id, cwd)) = self
             .selected_session()
             .map(|session| (session.id.clone(), session.cwd.clone()))
@@ -1187,6 +1196,16 @@ impl App {
         });
         self.notice = "Attaching to native Codex…".to_string();
         Ok(())
+    }
+
+    fn confirm_attach(&mut self) -> Result<()> {
+        if self.attach_right_armed {
+            self.request_attach()
+        } else {
+            self.attach_right_armed = true;
+            self.notice = "Press → again to attach".to_string();
+            Ok(())
+        }
     }
 
     fn toggle_compose_target(&mut self) {
@@ -1814,6 +1833,59 @@ mod tests {
         assert_eq!(request.thread_id, "thread-123");
         assert_eq!(request.cwd, PathBuf::from("/tmp/project"));
         std::fs::remove_file(state_path).expect("remove lifecycle state");
+    }
+
+    #[test]
+    fn attach_requires_two_right_arrow_presses_and_ignores_key_repeat() {
+        let (mut app, state_path) = test_app(true);
+        app.sessions
+            .push(test_session("thread-123", "Test", SessionStatus::Completed));
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("empty enter");
+        assert!(app.take_attach_request().is_none());
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("first right");
+        assert!(app.take_attach_request().is_none());
+        app.handle_key(
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat),
+            &mut sender,
+        )
+        .expect("held right");
+        assert!(app.take_attach_request().is_none());
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("intervening key");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("new first right");
+        assert!(app.take_attach_request().is_none());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("second right");
+
+        assert_eq!(
+            app.take_attach_request()
+                .expect("confirmed attach")
+                .thread_id,
+            "thread-123"
+        );
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
