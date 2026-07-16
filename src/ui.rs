@@ -276,7 +276,13 @@ fn render_resume_tab(
         let offset = selected.saturating_add(1).saturating_sub(viewport.max(1));
         lines.extend(items.iter().enumerate().skip(offset).take(viewport).map(
             |(index, session)| {
-                session_line(session, false, index == selected, panel.width as usize)
+                session_line(
+                    session,
+                    false,
+                    index == selected,
+                    None,
+                    panel.width as usize,
+                )
             },
         ));
     }
@@ -329,6 +335,7 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 session,
                 app.is_pinned(&session.id),
                 index == selected,
+                app.ctrl_x_confirmation(&session.id),
                 area.width as usize,
             )
         })
@@ -352,6 +359,7 @@ fn session_line(
     session: &crate::model::Session,
     pinned: bool,
     selected: bool,
+    confirmation: Option<&str>,
     width: usize,
 ) -> Line<'static> {
     let row_style = if selected {
@@ -369,7 +377,23 @@ fn session_line(
     } else {
         Style::default()
     };
-    let right = session.leaf_directory();
+    let (right, right_style) = if let Some(confirmation) = confirmation {
+        (
+            confirmation.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            session.leaf_directory(),
+            if selected {
+                row_style.remove_modifier(Modifier::BOLD)
+            } else {
+                row_style.fg(Color::DarkGray)
+            },
+        )
+    };
     let prefix_width = UnicodeWidthStr::width(pin) + UnicodeWidthStr::width(lamp);
     let right_width = UnicodeWidthStr::width(right.as_str());
     let title_budget = width
@@ -385,14 +409,7 @@ fn session_line(
         Span::styled(lamp.to_string(), lamp_style),
         Span::styled(title, row_style),
         Span::styled(spacer, row_style),
-        Span::styled(
-            right,
-            if selected {
-                row_style.remove_modifier(Modifier::BOLD)
-            } else {
-                row_style.fg(Color::DarkGray)
-            },
-        ),
+        Span::styled(right, right_style),
     ])
     .style(row_style)
 }
@@ -806,7 +823,7 @@ mod tests {
             history_loaded: true,
         };
 
-        let line = session_line(&session, false, true, 40);
+        let line = session_line(&session, false, true, None, 40);
         assert_eq!(line.style.fg, Some(Color::Cyan));
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
@@ -845,7 +862,7 @@ mod tests {
                 history_loaded: true,
             };
 
-            let line = session_line(&session, false, false, 40);
+            let line = session_line(&session, false, false, None, 40);
             assert_eq!(line.spans[0].content, "   ");
             assert_eq!(line.spans[1].content, "  ");
             assert!(!line.spans.iter().any(|span| span.content.contains('●')));
@@ -871,13 +888,36 @@ mod tests {
             history_loaded: true,
         };
 
-        let line = session_line(&session, true, false, 40);
+        let line = session_line(&session, true, false, None, 40);
         assert_eq!(line.spans[0].content, "📌 ");
         assert_eq!(line.spans[4].content, "project");
         assert_eq!(
             UnicodeWidthStr::width(line.spans[0].content.as_ref()),
             UnicodeWidthStr::width("   ")
         );
+    }
+
+    #[test]
+    fn ctrl_x_confirmation_replaces_directory_on_the_session_row() {
+        let session = Session {
+            id: "thread".to_string(),
+            title: "Working session".to_string(),
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            path: None,
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some("codeck".to_string()),
+            status: SessionStatus::Working,
+            active_turn_id: Some("turn".to_string()),
+            messages: Vec::new(),
+            history_loaded: true,
+        };
+
+        let line = session_line(&session, false, true, Some("Ctrl+X again: pause"), 60);
+        assert_eq!(line.spans[4].content, "Ctrl+X again: pause");
+        assert_eq!(line.spans[4].style.fg, Some(Color::Yellow));
+        assert!(!line.spans.iter().any(|span| span.content == "project"));
     }
 
     #[test]

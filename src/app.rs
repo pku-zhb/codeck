@@ -532,6 +532,17 @@ impl App {
         &self.notice
     }
 
+    pub fn ctrl_x_confirmation(&self, thread_id: &str) -> Option<&'static str> {
+        let confirmation = self
+            .ctrl_x_armed
+            .as_ref()
+            .filter(|confirmation| confirmation.thread_id == thread_id)?;
+        Some(match confirmation.action {
+            CtrlXAction::Pause => "Ctrl+X again: pause",
+            CtrlXAction::Remove => "Ctrl+X again: remove",
+        })
+    }
+
     pub fn scroll_back(&self) -> usize {
         self.scroll_back
     }
@@ -2129,18 +2140,11 @@ impl App {
             thread_id: session.id.clone(),
             action,
         };
-        let title = session.title.clone();
         if self.ctrl_x_armed.as_ref() == Some(&confirmation) {
             self.ctrl_x_armed = None;
             return self.stop_or_remove_selected(sender);
         }
         self.ctrl_x_armed = Some(confirmation);
-        self.notice = match action {
-            CtrlXAction::Pause => format!("Press Ctrl+X again to pause {title}"),
-            CtrlXAction::Remove => format!(
-                "Press Ctrl+X again to remove {title} from Codeck · Codex history will be kept"
-            ),
-        };
         Ok(())
     }
 
@@ -3309,7 +3313,11 @@ mod tests {
         )
         .expect("arm removal");
         assert_eq!(app.sessions.len(), 1);
-        assert!(app.notice.contains("Press Ctrl+X again"));
+        assert_eq!(
+            app.ctrl_x_confirmation("review-thread"),
+            Some("Ctrl+X again: remove")
+        );
+        assert!(!app.notice.contains("Ctrl+X again"));
         app.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
             &mut sender,
@@ -3632,7 +3640,11 @@ mod tests {
         )
         .expect("arm pause");
         assert!(sender.requests.is_empty());
-        assert!(app.notice.contains("Press Ctrl+X again"));
+        assert_eq!(
+            app.ctrl_x_confirmation("working-thread"),
+            Some("Ctrl+X again: pause")
+        );
+        assert!(!app.notice.contains("Ctrl+X again"));
         app.handle_key(
             KeyEvent::new_with_kind(
                 KeyCode::Char('x'),
@@ -3675,10 +3687,14 @@ mod tests {
             &mut sender,
         )
         .expect("intervening key");
+        assert_eq!(app.ctrl_x_confirmation("working-thread"), None);
         app.handle_key(ctrl_x, &mut sender).expect("re-arm pause");
 
         assert!(sender.requests.is_empty());
-        assert!(app.notice.contains("Press Ctrl+X again"));
+        assert_eq!(
+            app.ctrl_x_confirmation("working-thread"),
+            Some("Ctrl+X again: pause")
+        );
         let _ = std::fs::remove_file(state_path);
     }
 

@@ -70,7 +70,8 @@ codeck --check
 - `Ctrl+R`: rename the selected session
 - `Ctrl+X`, twice consecutively: pause a working session; remove a
   completed/failed session from Codeck while preserving its Codex history;
-  holding the key does not confirm either action
+  after the first press, confirmation appears directly on the selected session
+  row instead of in the composer; holding the key does not confirm either action
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
 - Mouse wheel: scroll only the conversation preview; it never changes the
