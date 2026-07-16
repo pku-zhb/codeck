@@ -738,9 +738,17 @@ impl App {
                     if status.is_live() {
                         self.track_session(thread_id)?;
                     }
+                    let mut completed_transition = false;
                     if let Some(session) = self.session_mut(thread_id) {
+                        completed_transition = session.status.is_live() && !status.is_live();
                         session.status = status;
-                        self.sort_sessions_preserving_selection();
+                        if completed_transition {
+                            session.history_loaded = false;
+                        }
+                    }
+                    self.sort_sessions_preserving_selection();
+                    if completed_transition {
+                        self.ensure_selected_history(sender)?;
                     }
                 }
             }
@@ -769,7 +777,7 @@ impl App {
                 }
             }
             "turn/started" => self.handle_turn_started(&params)?,
-            "turn/completed" => self.handle_turn_completed(&params)?,
+            "turn/completed" => self.handle_turn_completed(&params, sender)?,
             "item/started" => self.handle_item(&params, false),
             "item/completed" => self.handle_item(&params, true),
             "item/agentMessage/delta" => self.handle_agent_delta(&params),
@@ -1221,6 +1229,7 @@ impl App {
 
     fn merge_session(&mut self, incoming: Session) {
         if let Some(existing) = self.session_mut(&incoming.id) {
+            let completed_transition = existing.status.is_live() && !incoming.status.is_live();
             existing.title = incoming.title;
             existing.preview = incoming.preview;
             existing.cwd = incoming.cwd;
@@ -1229,6 +1238,9 @@ impl App {
             existing.source = incoming.source;
             existing.thread_source = incoming.thread_source;
             existing.status = incoming.status;
+            if completed_transition {
+                existing.history_loaded = false;
+            }
         } else {
             self.sessions.push(incoming);
         }
@@ -1284,13 +1296,20 @@ impl App {
         Ok(())
     }
 
-    fn handle_turn_completed(&mut self, params: &Value) -> Result<()> {
+    fn handle_turn_completed(&mut self, params: &Value, sender: &mut impl RpcSender) -> Result<()> {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
             return Ok(());
         };
         self.track_session(thread_id)?;
         let turn = params.get("turn").unwrap_or(&Value::Null);
         let turn_status = turn.get("status").and_then(Value::as_str);
+        let completed_entries = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(message_from_item)
+            .collect::<Vec<_>>();
         if let Some(session) = self.session_mut(thread_id) {
             session.status = if turn_status == Some("failed") {
                 SessionStatus::Failed
@@ -1299,6 +1318,13 @@ impl App {
             };
             session.active_turn_id = None;
             session.updated_at = unix_now();
+            for entry in completed_entries {
+                if entry.kind == MessageKind::User {
+                    remove_matching_local_user(session, &entry.text);
+                }
+                session.upsert_message(entry);
+            }
+            session.history_loaded = true;
             if let Some(error) = turn
                 .get("error")
                 .and_then(|error| error.get("message"))
@@ -1322,6 +1348,10 @@ impl App {
             _ => "Session completed".to_string(),
         };
         self.sort_sessions_preserving_selection();
+        self.pending_calls.retain(|_, call| {
+            !matches!(call, PendingCall::ThreadRead { thread_id: pending } if pending == thread_id)
+        });
+        self.load_history(thread_id, sender)?;
         Ok(())
     }
 
@@ -2083,17 +2113,14 @@ fn prompt_input(draft: &PromptDraft) -> Vec<Value> {
 }
 
 fn draft_display(draft: &PromptDraft) -> String {
-    let image_label = match draft.images.len() {
-        0 => String::new(),
-        1 => "🖼 1 image".to_string(),
-        count => format!("🖼 {count} images"),
-    };
-    match (draft.text.is_empty(), image_label.is_empty()) {
-        (false, false) => format!("{}\n\n{}", draft.text, image_label),
-        (false, true) => draft.text.clone(),
-        (true, false) => image_label,
-        (true, true) => String::new(),
+    let display = draft.composer.text.trim();
+    if !display.is_empty() {
+        return display.to_string();
     }
+    (1..=draft.images.len())
+        .map(|number| format!("[Image #{number}]"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn message_from_item(item: &Value) -> Option<MessageEntry> {
@@ -2161,21 +2188,23 @@ fn item_kind(item: &Value) -> Option<MessageKind> {
 }
 
 fn user_input_text(content: Option<&Value>) -> String {
-    content
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("text") => part
-                .get("text")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            Some("localImage") => Some("🖼 local image".to_string()),
-            Some("image") => Some("🖼 image".to_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut image_number = 0usize;
+    let mut parts = Vec::new();
+    for part in content.and_then(Value::as_array).into_iter().flatten() {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                }
+            }
+            Some("localImage" | "image") => {
+                image_number = image_number.saturating_add(1);
+                parts.push(format!("[Image #{image_number}]"));
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
 }
 
 fn active_turn_id(thread: &Value) -> Option<String> {
@@ -2350,17 +2379,47 @@ fn user_message_signature(text: &str) -> (String, bool) {
     let mut has_image = false;
     let mut body_lines = Vec::new();
     for line in text.lines() {
-        if is_image_marker(line.trim()) {
+        let (line, inline_image) = strip_inline_image_markers(line);
+        has_image |= inline_image;
+        if is_legacy_image_marker(line.trim()) {
             has_image = true;
         } else {
             body_lines.push(line);
         }
     }
-    let body = body_lines.join("\n").trim().to_string();
+    let body = body_lines
+        .join("\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     (body, has_image)
 }
 
-fn is_image_marker(line: &str) -> bool {
+fn strip_inline_image_markers(line: &str) -> (String, bool) {
+    const PREFIX: &str = "[Image #";
+    let mut output = String::new();
+    let mut remaining = line;
+    let mut found = false;
+    while let Some(start) = remaining.find(PREFIX) {
+        output.push_str(&remaining[..start]);
+        let marker = &remaining[start + PREFIX.len()..];
+        let Some(end) = marker.find(']') else {
+            output.push_str(&remaining[start..]);
+            return (output, found);
+        };
+        if marker[..end].parse::<usize>().is_ok() {
+            found = true;
+            remaining = &marker[end + 1..];
+        } else {
+            output.push_str(PREFIX);
+            remaining = marker;
+        }
+    }
+    output.push_str(remaining);
+    (output, found)
+}
+
+fn is_legacy_image_marker(line: &str) -> bool {
     let Some(label) = line.strip_prefix("🖼 ") else {
         return false;
     };
@@ -2998,7 +3057,7 @@ mod tests {
                 .last()
                 .expect("local user message")
                 .text,
-            "🖼 1 image"
+            "[Image #1]"
         );
         let _ = std::fs::remove_file(state_path);
     }
@@ -3032,6 +3091,14 @@ mod tests {
                 })
             ))
         );
+        assert_eq!(
+            app.sessions[0]
+                .messages
+                .last()
+                .expect("inline image preview")
+                .text,
+            "look [Image #1] please"
+        );
         let _ = std::fs::remove_file(state_path);
     }
 
@@ -3042,7 +3109,7 @@ mod tests {
                 {"type":"text","text":"Inspect this"},
                 {"type":"localImage","path":"/tmp/pasted.png"}
             ]))),
-            "Inspect this\n🖼 local image"
+            "Inspect this\n[Image #1]"
         );
     }
 
@@ -3052,13 +3119,118 @@ mod tests {
         session.messages.push(MessageEntry {
             id: "local-user-1".to_string(),
             kind: MessageKind::User,
-            text: "测试一下你是否真的收到了图\n\n🖼 1 image".to_string(),
+            text: "测试一下[Image #1]你是否真的收到了图".to_string(),
         });
 
-        remove_matching_local_user(&mut session, "测试一下你是否真的收到了图\n🖼 local image");
+        remove_matching_local_user(&mut session, "测试一下你是否真的收到了图\n[Image #1]");
 
         assert!(session.messages.is_empty());
-        assert_eq!(user_message_signature("🖼 2 images"), (String::new(), true));
+        assert_eq!(
+            user_message_signature("[Image #1] [Image #2]"),
+            (String::new(), true)
+        );
+    }
+
+    #[test]
+    fn turn_completed_merges_final_and_requests_authoritative_history() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "completed-thread",
+            "Completed",
+            SessionStatus::Working,
+        ));
+        let mut sender = test_sender();
+
+        app.handle_notification(
+            "turn/completed",
+            json!({
+                "threadId": "completed-thread",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "id": "final-1",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "The final answer"
+                    }]
+                }
+            }),
+            &mut sender,
+        )
+        .expect("complete turn");
+
+        assert_eq!(app.sessions[0].status, SessionStatus::Completed);
+        assert!(
+            app.sessions[0].messages.iter().any(|entry| {
+                entry.kind == MessageKind::Final && entry.text == "The final answer"
+            })
+        );
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/read".to_string(),
+                json!({"threadId":"completed-thread","includeTurns":true})
+            ))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn completed_status_transition_refreshes_selected_history() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "completed-thread",
+            "Completed",
+            SessionStatus::Working,
+        ));
+        let mut sender = test_sender();
+
+        app.handle_notification(
+            "thread/status/changed",
+            json!({
+                "threadId": "completed-thread",
+                "status": {"type": "idle"}
+            }),
+            &mut sender,
+        )
+        .expect("complete thread");
+
+        assert_eq!(app.sessions[0].status, SessionStatus::Completed);
+        assert!(!app.sessions[0].history_loaded);
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/read".to_string(),
+                json!({"threadId":"completed-thread","includeTurns":true})
+            ))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn polled_completion_marks_unselected_history_stale() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "selected-thread",
+            "Selected",
+            SessionStatus::Working,
+        ));
+        app.sessions.push(test_session(
+            "background-thread",
+            "Background",
+            SessionStatus::Working,
+        ));
+        let incoming = test_session("background-thread", "Background", SessionStatus::Completed);
+
+        app.merge_session(incoming);
+
+        let background = app
+            .session("background-thread")
+            .expect("background session");
+        assert_eq!(background.status, SessionStatus::Completed);
+        assert!(!background.history_loaded);
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
