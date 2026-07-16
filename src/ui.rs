@@ -8,7 +8,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, SkillPickerView};
 use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
-use crate::model::{ComposeTarget, MessageEntry, MessageKind, PreviewVerbosity, SessionStatus};
+use crate::model::{
+    ComposeTarget, ComposerToken, ComposerTokenKind, MessageEntry, MessageKind, PreviewVerbosity,
+    SessionStatus,
+};
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -31,11 +34,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(separator_height.saturating_mul(2))
         .saturating_sub(2)
         .max(1);
-    let input_prefix = composer_prefix(
-        app.composer().target,
-        app.selected_has_pending_request(),
-        app.composer().images.len(),
-    );
+    let input_prefix = composer_prefix(app.composer().target, app.selected_has_pending_request());
     let input_height = composer_height(
         &input_prefix,
         &app.composer().text,
@@ -450,7 +449,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let pending = app.selected_has_pending_request();
-    let prefix = composer_prefix(app.composer().target, pending, app.composer().images.len());
+    let prefix = composer_prefix(app.composer().target, pending);
     let prefix_style = match app.composer().target {
         ComposeTarget::NewTask => Style::default().fg(Color::Green),
         ComposeTarget::Reply if pending => Style::default().fg(Color::Yellow),
@@ -458,28 +457,25 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ComposeTarget::Rename => Style::default().fg(Color::Magenta),
     }
     .add_modifier(Modifier::BOLD);
-    let display = format!("{}{}", prefix, app.composer().text);
-    let cursor_byte = prefix.len() + app.composer().cursor;
-    let (all_lines, cursor_row, cursor_col) =
-        layout_with_cursor(&display, cursor_byte, area.width.max(1) as usize);
+    let (all_lines, cursor_row, cursor_col) = styled_composer_layout(
+        &prefix,
+        &app.composer().text,
+        app.composer().cursor,
+        &app.composer().tokens,
+        prefix_style,
+        area.width.max(1) as usize,
+    );
     let offset = cursor_row.saturating_sub(area.height.saturating_sub(1) as usize);
 
     let mut visible = Vec::new();
     for row in 0..area.height as usize {
         let source_row = offset + row;
-        let text = all_lines.get(source_row).cloned().unwrap_or_default();
-        if source_row == 0 {
-            let rest = text.strip_prefix(&prefix).unwrap_or(&text).to_string();
-            let mut spans = vec![Span::styled(prefix.clone(), prefix_style)];
-            if rest.is_empty() && app.composer().text.is_empty() {
-                spans.push(Span::styled(composer_hint(app), dim_style()));
-            } else {
-                spans.push(Span::raw(rest));
-            }
-            visible.push(Line::from(spans));
-        } else {
-            visible.push(Line::from(text));
+        let mut line = all_lines.get(source_row).cloned().unwrap_or_default();
+        if source_row == 0 && app.composer().text.is_empty() {
+            line.spans
+                .push(Span::styled(composer_hint(app), dim_style()));
         }
+        visible.push(line);
     }
 
     frame.render_widget(Paragraph::new(Text::from(visible)), area);
@@ -494,18 +490,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn composer_prefix(target: ComposeTarget, pending: bool, image_count: usize) -> String {
-    let base = match target {
+fn composer_prefix(target: ComposeTarget, pending: bool) -> String {
+    match target {
         ComposeTarget::NewTask => "＋ new › ",
         ComposeTarget::Reply if pending => "？ answer › ",
         ComposeTarget::Reply => "↳ reply › ",
         ComposeTarget::Rename => "✎ rename › ",
-    };
-    if image_count == 0 {
-        base.to_string()
-    } else {
-        format!("{}🖼{} ", base, image_count)
     }
+    .to_string()
 }
 
 fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 {
@@ -561,6 +553,86 @@ fn layout_with_cursor(text: &str, cursor_byte: usize, width: usize) -> (Vec<Stri
     (lines, cursor_row, cursor_col)
 }
 
+fn styled_composer_layout(
+    prefix: &str,
+    text: &str,
+    cursor: usize,
+    tokens: &[ComposerToken],
+    prefix_style: Style,
+    width: usize,
+) -> (Vec<Line<'static>>, usize, usize) {
+    let width = width.max(1);
+    let display = format!("{prefix}{text}");
+    let cursor_byte = prefix.len() + cursor;
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut row = 0usize;
+    let mut column = 0usize;
+    let mut cursor_position = None;
+
+    for (byte, grapheme) in display.grapheme_indices(true) {
+        if byte == cursor_byte {
+            cursor_position = Some((row, column));
+        }
+        if grapheme == "\n" {
+            lines.push(Vec::new());
+            row += 1;
+            column = 0;
+            continue;
+        }
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        if column > 0 && column + grapheme_width > width {
+            lines.push(Vec::new());
+            row += 1;
+            column = 0;
+        }
+        let style = if byte < prefix.len() {
+            prefix_style
+        } else {
+            token_style_at(tokens, byte - prefix.len()).unwrap_or_default()
+        };
+        push_styled_grapheme(&mut lines[row], grapheme, style);
+        column += grapheme_width;
+        if column >= width {
+            lines.push(Vec::new());
+            row += 1;
+            column = 0;
+        }
+    }
+    if cursor_byte == display.len() {
+        cursor_position = Some((row, column));
+    }
+    let (cursor_row, cursor_col) = cursor_position.unwrap_or((row, column));
+    (
+        lines.into_iter().map(Line::from).collect(),
+        cursor_row,
+        cursor_col,
+    )
+}
+
+fn token_style_at(tokens: &[ComposerToken], byte: usize) -> Option<Style> {
+    tokens
+        .iter()
+        .find(|token| token.start <= byte && byte < token.style_end)
+        .map(|token| match &token.kind {
+            ComposerTokenKind::Skill(_) => Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+            ComposerTokenKind::Image(_) => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        })
+}
+
+fn push_styled_grapheme(spans: &mut Vec<Span<'static>>, grapheme: &str, style: Style) {
+    if let Some(previous) = spans.last_mut()
+        && previous.style == style
+    {
+        previous.content.to_mut().push_str(grapheme);
+        return;
+    }
+    spans.push(Span::styled(grapheme.to_string(), style));
+}
+
 fn truncate_display(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -612,10 +684,45 @@ mod tests {
         assert_eq!(composer_height("＋ new › ", "", 40, 10), 1);
         assert_eq!(composer_height("＋ new › ", "1234567890", 10, 10), 2);
         assert_eq!(composer_height("＋ new › ", "\nsecond\nthird", 40, 2), 2);
-        assert_eq!(
-            composer_prefix(ComposeTarget::Reply, false, 2),
-            "↳ reply › 🖼2 "
+        assert_eq!(composer_prefix(ComposeTarget::Reply, false), "↳ reply › ");
+    }
+
+    #[test]
+    fn composer_tokens_use_ansi_foreground_without_background() {
+        let mut composer = crate::model::Composer::default();
+        composer.insert("$doc");
+        composer.replace_with_skill(
+            0,
+            crate::model::SkillReference {
+                name: "documents".to_string(),
+                path: "/tmp/documents/SKILL.md".to_string(),
+            },
         );
+        composer.attach_image(std::path::PathBuf::from("/tmp/chart.png"));
+
+        let (lines, _, _) = styled_composer_layout(
+            "＋ new › ",
+            &composer.text,
+            composer.cursor,
+            &composer.tokens,
+            Style::default().fg(Color::Green),
+            80,
+        );
+        let skill = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("$documents"))
+            .expect("styled skill token");
+        let image = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("[Image #1]"))
+            .expect("styled image token");
+
+        assert_eq!(skill.style.fg, Some(Color::Magenta));
+        assert_eq!(image.style.fg, Some(Color::Yellow));
+        assert!(skill.style.bg.is_none());
+        assert!(image.style.bg.is_none());
     }
 
     #[test]

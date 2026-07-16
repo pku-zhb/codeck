@@ -203,12 +203,28 @@ pub struct Composer {
     pub target: ComposeTarget,
     pub images: Vec<PathBuf>,
     pub skills: Vec<SkillReference>,
+    pub tokens: Vec<ComposerToken>,
+    next_image_number: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillReference {
     pub name: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerToken {
+    pub start: usize,
+    pub style_end: usize,
+    pub end: usize,
+    pub kind: ComposerTokenKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerTokenKind {
+    Skill(SkillReference),
+    Image(PathBuf),
 }
 
 impl Default for Composer {
@@ -219,19 +235,30 @@ impl Default for Composer {
             target: ComposeTarget::NewTask,
             images: Vec::new(),
             skills: Vec::new(),
+            tokens: Vec::new(),
+            next_image_number: 1,
         }
     }
 }
 
 impl Composer {
     pub fn insert(&mut self, text: &str) {
-        self.text.insert_str(self.cursor, text);
+        let position = self.cursor;
+        self.shift_tokens_for_insertion(position, text.len());
+        self.text.insert_str(position, text);
         self.cursor += text.len();
-        self.prune_skills();
     }
 
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
+            return;
+        }
+        if let Some(index) = self
+            .tokens
+            .iter()
+            .position(|token| token.end == self.cursor)
+        {
+            self.remove_token(index);
             return;
         }
         let previous = self.text[..self.cursor]
@@ -239,13 +266,19 @@ impl Composer {
             .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
-        self.text.drain(previous..self.cursor);
-        self.cursor = previous;
-        self.prune_skills();
+        self.delete_plain_range(previous, self.cursor);
     }
 
     pub fn delete(&mut self) {
         if self.cursor >= self.text.len() {
+            return;
+        }
+        if let Some(index) = self
+            .tokens
+            .iter()
+            .position(|token| token.start == self.cursor)
+        {
+            self.remove_token(index);
             return;
         }
         let next = self.text[self.cursor..]
@@ -253,11 +286,14 @@ impl Composer {
             .nth(1)
             .map(|(index, _)| self.cursor + index)
             .unwrap_or(self.text.len());
-        self.text.drain(self.cursor..next);
-        self.prune_skills();
+        self.delete_plain_range(self.cursor, next);
     }
 
     pub fn move_left(&mut self) {
+        if let Some(token) = self.tokens.iter().find(|token| token.end == self.cursor) {
+            self.cursor = token.start;
+            return;
+        }
         self.cursor = self.text[..self.cursor]
             .grapheme_indices(true)
             .next_back()
@@ -269,6 +305,10 @@ impl Composer {
         if self.cursor >= self.text.len() {
             return;
         }
+        if let Some(token) = self.tokens.iter().find(|token| token.start == self.cursor) {
+            self.cursor = token.end;
+            return;
+        }
         self.cursor = self.text[self.cursor..]
             .grapheme_indices(true)
             .nth(1)
@@ -276,17 +316,55 @@ impl Composer {
             .unwrap_or(self.text.len());
     }
 
-    pub fn take(&mut self) -> String {
+    pub fn prompt_text(&self) -> String {
+        let mut text = self.text.clone();
+        let mut images = self
+            .tokens
+            .iter()
+            .filter(|token| matches!(&token.kind, ComposerTokenKind::Image(_)))
+            .collect::<Vec<_>>();
+        images.sort_by_key(|token| std::cmp::Reverse(token.start));
+        for token in images {
+            text.replace_range(token.start..token.end, "");
+        }
+        text
+    }
+
+    pub fn reset(&mut self) {
+        self.text.clear();
         self.cursor = 0;
-        std::mem::take(&mut self.text)
+        self.images.clear();
+        self.skills.clear();
+        self.tokens.clear();
+        self.next_image_number = 1;
     }
 
-    pub fn take_images(&mut self) -> Vec<PathBuf> {
-        std::mem::take(&mut self.images)
+    pub fn clear_text_keep_images(&mut self) {
+        let images = self.images.clone();
+        self.reset();
+        for image in images {
+            self.attach_image(image);
+        }
     }
 
-    pub fn take_skills(&mut self) -> Vec<SkillReference> {
-        std::mem::take(&mut self.skills)
+    pub fn attach_image(&mut self, path: PathBuf) -> bool {
+        if self.images.contains(&path) {
+            return false;
+        }
+        let placeholder = format!("[Image #{}] ", self.next_image_number);
+        self.next_image_number = self.next_image_number.saturating_add(1);
+        let start = self.cursor;
+        self.insert(&placeholder);
+        let end = self.cursor;
+        self.tokens.push(ComposerToken {
+            start,
+            style_end: end.saturating_sub(1),
+            end,
+            kind: ComposerTokenKind::Image(path.clone()),
+        });
+        self.tokens.sort_by_key(|token| token.start);
+        self.images.push(path);
+        true
     }
 
     pub fn replace_with_skill(&mut self, start: usize, skill: SkillReference) {
@@ -294,22 +372,99 @@ impl Composer {
             return;
         }
         let replacement = format!("${} ", skill.name);
-        self.text.replace_range(start..self.cursor, &replacement);
-        self.cursor = start + replacement.len();
-        self.skills.retain(|existing| existing.path != skill.path);
-        self.skills.push(skill);
-        self.prune_skills();
+        let style_end = start + replacement.len().saturating_sub(1);
+        self.replace_plain_range(start, self.cursor, &replacement);
+        let end = self.cursor;
+        if !self
+            .skills
+            .iter()
+            .any(|existing| existing.path == skill.path)
+        {
+            self.skills.push(skill.clone());
+        }
+        self.tokens.push(ComposerToken {
+            start,
+            style_end,
+            end,
+            kind: ComposerTokenKind::Skill(skill),
+        });
+        self.tokens.sort_by_key(|token| token.start);
     }
 
-    fn prune_skills(&mut self) {
-        self.skills
-            .retain(|skill| has_skill_token(&self.text, &skill.name));
+    fn shift_tokens_for_insertion(&mut self, position: usize, length: usize) {
+        for token in &mut self.tokens {
+            if token.start >= position {
+                token.start = token.start.saturating_add(length);
+                token.style_end = token.style_end.saturating_add(length);
+                token.end = token.end.saturating_add(length);
+            }
+        }
     }
-}
 
-fn has_skill_token(text: &str, name: &str) -> bool {
-    let token = format!("${name}");
-    text.split_whitespace().any(|part| part == token)
+    fn delete_plain_range(&mut self, start: usize, end: usize) {
+        self.text.replace_range(start..end, "");
+        let removed = end.saturating_sub(start);
+        for token in &mut self.tokens {
+            if token.start >= end {
+                token.start = token.start.saturating_sub(removed);
+                token.style_end = token.style_end.saturating_sub(removed);
+                token.end = token.end.saturating_sub(removed);
+            }
+        }
+        self.cursor = start;
+    }
+
+    fn replace_plain_range(&mut self, start: usize, end: usize, replacement: &str) {
+        self.text.replace_range(start..end, replacement);
+        let removed = end.saturating_sub(start);
+        let added = replacement.len();
+        for token in &mut self.tokens {
+            if token.start >= end {
+                if added >= removed {
+                    let shift = added - removed;
+                    token.start = token.start.saturating_add(shift);
+                    token.style_end = token.style_end.saturating_add(shift);
+                    token.end = token.end.saturating_add(shift);
+                } else {
+                    let shift = removed - added;
+                    token.start = token.start.saturating_sub(shift);
+                    token.style_end = token.style_end.saturating_sub(shift);
+                    token.end = token.end.saturating_sub(shift);
+                }
+            }
+        }
+        self.cursor = start + added;
+    }
+
+    fn remove_token(&mut self, index: usize) {
+        let token = self.tokens.remove(index);
+        let removed = token.end.saturating_sub(token.start);
+        self.text.replace_range(token.start..token.end, "");
+        for remaining in &mut self.tokens {
+            if remaining.start >= token.end {
+                remaining.start = remaining.start.saturating_sub(removed);
+                remaining.style_end = remaining.style_end.saturating_sub(removed);
+                remaining.end = remaining.end.saturating_sub(removed);
+            }
+        }
+        match token.kind {
+            ComposerTokenKind::Image(path) => {
+                if !self.tokens.iter().any(
+                    |remaining| matches!(&remaining.kind, ComposerTokenKind::Image(value) if value == &path),
+                ) {
+                    self.images.retain(|image| image != &path);
+                }
+            }
+            ComposerTokenKind::Skill(skill) => {
+                if !self.tokens.iter().any(
+                    |remaining| matches!(&remaining.kind, ComposerTokenKind::Skill(value) if value.path == skill.path),
+                ) {
+                    self.skills.retain(|value| value.path != skill.path);
+                }
+            }
+        }
+        self.cursor = token.start;
+    }
 }
 
 fn source_label(value: Option<&Value>) -> String {
@@ -363,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_keeps_only_intact_selected_skill_tokens() {
+    fn composer_treats_selected_skill_as_an_atomic_token() {
         let mut composer = Composer::default();
         composer.insert("$doc");
         composer.replace_with_skill(
@@ -375,10 +530,47 @@ mod tests {
         );
         assert_eq!(composer.text, "$documents ");
         assert_eq!(composer.skills.len(), 1);
+        assert_eq!(composer.tokens.len(), 1);
+
+        composer.move_left();
+        assert_eq!(composer.cursor, 0);
+        composer.move_right();
+        assert_eq!(composer.cursor, composer.text.len());
+        composer.backspace();
+        assert!(composer.text.is_empty());
+        assert!(composer.skills.is_empty());
+        assert!(composer.tokens.is_empty());
+    }
+
+    #[test]
+    fn composer_inserts_images_at_the_cursor_and_strips_placeholders_from_prompt() {
+        let mut composer = Composer::default();
+        composer.insert("before after");
+        composer.cursor = "before ".len();
+        let image = PathBuf::from("/tmp/chart.png");
+
+        assert!(composer.attach_image(image.clone()));
+        assert_eq!(composer.text, "before [Image #1] after");
+        assert_eq!(composer.prompt_text(), "before after");
+        assert_eq!(composer.images, vec![image]);
 
         composer.backspace();
-        assert_eq!(composer.skills.len(), 1);
-        composer.backspace();
-        assert!(composer.skills.is_empty());
+        assert_eq!(composer.text, "before after");
+        assert!(composer.images.is_empty());
+        assert!(composer.tokens.is_empty());
+    }
+
+    #[test]
+    fn composer_shifts_atomic_tokens_when_editing_before_them() {
+        let mut composer = Composer::default();
+        composer.attach_image(PathBuf::from("/tmp/chart.png"));
+        composer.cursor = 0;
+        composer.insert("look ");
+
+        assert_eq!(composer.tokens[0].start, "look ".len());
+        composer.cursor = composer.tokens[0].start;
+        composer.delete();
+        assert_eq!(composer.text, "look ");
+        assert!(composer.images.is_empty());
     }
 }

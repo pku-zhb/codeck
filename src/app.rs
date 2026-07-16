@@ -94,6 +94,7 @@ struct PromptDraft {
     text: String,
     images: Vec<PathBuf>,
     skills: Vec<SkillReference>,
+    composer: Composer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,10 +304,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('u') => {
-                    self.composer.text.clear();
-                    self.composer.cursor = 0;
-                    self.composer.images.clear();
-                    self.composer.skills.clear();
+                    self.composer.reset();
                     self.skill_picker = None;
                     return Ok(());
                 }
@@ -417,9 +415,7 @@ impl App {
     fn add_images(&mut self, paths: Vec<PathBuf>) {
         let before = self.composer.images.len();
         for path in paths {
-            if !self.composer.images.contains(&path) {
-                self.composer.images.push(path);
-            }
+            self.composer.attach_image(path);
         }
         let added = self.composer.images.len().saturating_sub(before);
         self.attach_right_armed = false;
@@ -427,17 +423,14 @@ impl App {
             "Image is already attached".to_string()
         } else {
             format!(
-                "Attached {added} image{} · Backspace on empty input removes the last one",
+                "Attached {added} image{} · Backspace removes the image token",
                 if added == 1 { "" } else { "s" }
             )
         };
     }
 
     fn restore_draft(&mut self, draft: PromptDraft) {
-        self.composer.text = draft.text;
-        self.composer.cursor = self.composer.text.len();
-        self.composer.images = draft.images;
-        self.composer.skills = draft.skills;
+        self.composer = draft.composer;
     }
 
     pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
@@ -964,13 +957,17 @@ impl App {
     }
 
     fn submit(&mut self, sender: &mut impl RpcSender) -> Result<()> {
-        let text = self.composer.text.trim().to_string();
         let target = self.composer.target;
+        let text = if target == ComposeTarget::Rename {
+            self.composer.text.trim().to_string()
+        } else {
+            self.composer.prompt_text().trim().to_string()
+        };
         if target == ComposeTarget::Rename {
             if text.is_empty() {
                 return Ok(());
             }
-            self.composer.take();
+            self.composer.reset();
             let Some(thread_id) = self.rename_thread_id.clone() else {
                 self.cancel_rename();
                 self.notice = "Rename target is no longer available".to_string();
@@ -1000,8 +997,7 @@ impl App {
                     "This request needs a text answer; attached images were kept".to_string();
                 return Ok(());
             }
-            self.composer.take();
-            self.composer.take_skills();
+            self.composer.clear_text_keep_images();
             self.cache_current_draft();
             self.answer_pending_request(&thread_id, &text, sender)?;
             return Ok(());
@@ -1010,12 +1006,14 @@ impl App {
         if text.is_empty() && self.composer.images.is_empty() {
             return Ok(());
         }
-        self.composer.take();
+        let composer = self.composer.clone();
         let draft = PromptDraft {
             text,
-            images: self.composer.take_images(),
-            skills: self.composer.take_skills(),
+            images: composer.images.clone(),
+            skills: composer.skills.clone(),
+            composer,
         };
+        self.composer.reset();
         self.cache_current_draft();
         self.scroll_back = 0;
 
@@ -1038,8 +1036,8 @@ impl App {
                 let Some(thread_id) = self.selected_session().map(|session| session.id.clone())
                 else {
                     self.notice = "No session selected; switched to new task".to_string();
-                    self.composer.target = ComposeTarget::NewTask;
                     self.restore_draft(draft);
+                    self.composer.target = ComposeTarget::NewTask;
                     self.cache_current_draft();
                     return Ok(());
                 };
@@ -1747,9 +1745,10 @@ impl App {
             .reply_drafts
             .get(thread_id)
             .cloned()
-            .unwrap_or_else(|| Composer {
-                target: ComposeTarget::Reply,
-                ..Composer::default()
+            .unwrap_or_else(|| {
+                let mut composer = Composer::default();
+                composer.target = ComposeTarget::Reply;
+                composer
             });
         self.composer.target = ComposeTarget::Reply;
     }
@@ -1766,10 +1765,9 @@ impl App {
         }
         self.rename_thread_id = Some(thread_id);
         self.composer.target = ComposeTarget::Rename;
+        self.composer.reset();
         self.composer.text = title;
         self.composer.cursor = self.composer.text.len();
-        self.composer.images.clear();
-        self.composer.skills.clear();
         self.notice = "Edit the name and press Enter · Tab cancels".to_string();
     }
 
@@ -2976,7 +2974,8 @@ mod tests {
         session.active_turn_id = Some("turn-1".to_string());
         app.sessions.push(session);
         app.composer.target = ComposeTarget::Reply;
-        app.composer.images.push(PathBuf::from("/tmp/pasted.png"));
+        app.add_images(vec![PathBuf::from("/tmp/pasted.png")]);
+        assert_eq!(app.composer.text, "[Image #1] ");
         let mut sender = test_sender();
 
         app.submit(&mut sender).expect("submit image reply");
@@ -3000,6 +2999,38 @@ mod tests {
                 .expect("local user message")
                 .text,
             "🖼 1 image"
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn inline_image_placeholder_is_not_sent_as_prompt_text() {
+        let (mut app, state_path) = test_app(false);
+        let mut session = test_session("image-thread", "Image", SessionStatus::Working);
+        session.active_turn_id = Some("turn-1".to_string());
+        app.sessions.push(session);
+        app.composer.target = ComposeTarget::Reply;
+        app.insert_text("look please");
+        app.composer.cursor = "look ".len();
+        app.add_images(vec![PathBuf::from("/tmp/pasted.png")]);
+        assert_eq!(app.composer.text, "look [Image #1] please");
+        let mut sender = test_sender();
+
+        app.submit(&mut sender).expect("submit image reply");
+
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "turn/steer".to_string(),
+                json!({
+                    "threadId":"image-thread",
+                    "expectedTurnId":"turn-1",
+                    "input":[
+                        {"type":"text","text":"look please","text_elements":[]},
+                        {"type":"localImage","path":"/tmp/pasted.png"}
+                    ]
+                })
+            ))
         );
         let _ = std::fs::remove_file(state_path);
     }

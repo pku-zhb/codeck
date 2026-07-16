@@ -55,7 +55,8 @@ codex-deck --check
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
 - `$`: open the Codex skill picker; keep typing to filter, choose with `Up` /
-  `Down`, and insert with `Enter` or `Tab`
+  `Down`, and insert with `Enter` or `Tab`; confirmed skills become colored,
+  atomic `$skill-name` tokens
 - `Ctrl+N`: compose a new task
 - `Ctrl+V` (or `Cmd+V` when the terminal forwards it): attach an image from the
   system clipboard; pasting one or more image file paths also attaches them
@@ -69,9 +70,12 @@ codex-deck --check
   selected session in the picker
 - `Ctrl+C`: close the dashboard; running tasks continue
 
-Attached images are shown as an `🖼N` counter in the composer and are sent as
-native Codex `localImage` inputs. With an empty text field, `Backspace` removes
-the most recently attached image. Image-only prompts are supported.
+Attached images are inserted at the current cursor as colored `[Image #N]`
+tokens, so surrounding text stays visually continuous. The visible placeholder
+is removed from prompt text and the image is sent as a native Codex `localImage`
+input. Confirmed image and skill tokens are atomic: `Left` / `Right` jump across
+the whole token, while adjacent `Backspace` or `Delete` removes it in one step.
+Image-only prompts are supported.
 
 Drafts are isolated by intent: `New` has one global draft, while `Reply` keeps a
 separate in-memory draft for every session. Moving with `Up` / `Down` saves and
