@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::client::state_dir;
+use crate::model::PreviewVerbosity;
 
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LifecycleData {
@@ -19,6 +20,8 @@ struct LifecycleData {
     tracked_sessions: BTreeSet<String>,
     #[serde(default)]
     pinned_sessions: BTreeSet<String>,
+    #[serde(default)]
+    preview_verbosity: PreviewVerbosity,
 }
 
 pub struct LifecycleStore {
@@ -61,6 +64,17 @@ impl LifecycleStore {
 
     pub fn is_pinned(&self, thread_id: &str) -> bool {
         self.data.pinned_sessions.contains(thread_id)
+    }
+
+    pub fn preview_verbosity(&self) -> PreviewVerbosity {
+        self.data.preview_verbosity
+    }
+
+    pub fn set_preview_verbosity(&mut self, verbosity: PreviewVerbosity) {
+        if self.data.preview_verbosity != verbosity {
+            self.data.preview_verbosity = verbosity;
+            self.dirty = true;
+        }
     }
 
     pub fn track(&mut self, thread_id: impl Into<String>) {

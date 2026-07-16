@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -58,6 +59,28 @@ pub enum MessageKind {
     Final,
     Question,
     System,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewVerbosity {
+    #[default]
+    Full,
+    Progress,
+    Final,
+}
+
+impl PreviewVerbosity {
+    pub fn includes(self, kind: MessageKind) -> bool {
+        match kind {
+            MessageKind::Thinking => self == Self::Full,
+            MessageKind::Progress => self != Self::Final,
+            MessageKind::User
+            | MessageKind::Final
+            | MessageKind::Question
+            | MessageKind::System => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

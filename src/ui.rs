@@ -8,11 +8,15 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
-use crate::model::{ComposeTarget, MessageEntry, MessageKind, SessionStatus};
+use crate::model::{ComposeTarget, MessageEntry, MessageKind, PreviewVerbosity, SessionStatus};
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if app.settings_open() {
+        render_settings(frame, area, app.settings_selection());
         return;
     }
 
@@ -54,6 +58,80 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_messages(frame, chunks[2], app);
     render_separator(frame, chunks[3]);
     render_composer(frame, chunks[4], app);
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, selected: PreviewVerbosity) {
+    let options = [
+        (
+            PreviewVerbosity::Full,
+            "🧠 ",
+            "Full",
+            "thinking, progress, and final replies",
+        ),
+        (
+            PreviewVerbosity::Progress,
+            "💬 ",
+            "Progress",
+            "progress and final replies",
+        ),
+        (
+            PreviewVerbosity::Final,
+            "✅ ",
+            "Final",
+            "final replies only",
+        ),
+    ];
+    let panel_height = 9u16.min(area.height);
+    let panel = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(panel_height) / 2,
+        area.width,
+        panel_height,
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Codex Deck Settings",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            "Preview verbosity",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let selected_index = options
+        .iter()
+        .position(|(verbosity, _, _, _)| *verbosity == selected)
+        .unwrap_or_default();
+    for (verbosity, emoji, label, description) in options {
+        let active = verbosity == selected;
+        let style = if active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if active { "› " } else { "  " }, style),
+            Span::styled(emoji, style),
+            Span::styled(format!("{label:<10}"), style),
+            Span::styled(description, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "↑↓ select · Enter save · ←← cancel · Ctrl+C close Deck",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), panel);
+
+    let cursor_y = panel.y.saturating_add(3 + selected_index as u16);
+    if cursor_y < panel.bottom() {
+        frame.set_cursor_position((panel.x.min(panel.right().saturating_sub(1)), cursor_y));
+    }
 }
 
 fn render_separator(frame: &mut Frame<'_>, area: Rect) {
@@ -209,7 +287,11 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "  No conversation content yet",
             dim_style(),
         )],
-        Some(session) => message_lines(&session.messages, area.width as usize),
+        Some(session) => message_lines(
+            &session.messages,
+            area.width as usize,
+            app.preview_verbosity(),
+        ),
         None => vec![StyledLine::from_span(
             "  New tasks will appear here and keep running after you close the deck.",
             dim_style(),
@@ -234,9 +316,16 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     apply_osc8_links(frame, area, visible);
 }
 
-fn message_lines(messages: &[MessageEntry], width: usize) -> Vec<StyledLine> {
+fn message_lines(
+    messages: &[MessageEntry],
+    width: usize,
+    verbosity: PreviewVerbosity,
+) -> Vec<StyledLine> {
     let mut lines = Vec::new();
-    for message in messages {
+    for message in messages
+        .iter()
+        .filter(|message| verbosity.includes(message.kind))
+    {
         let (prefix, prefix_style, text_style) = message_style(message.kind);
         let gutter_width = UnicodeWidthStr::width(prefix).max(1);
         let content_width = width.saturating_sub(gutter_width).max(1);
@@ -363,7 +452,7 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
 }
 
 fn composer_hint(app: &App) -> String {
-    let base = "Ctrl+V image · →→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
+    let base = "←← settings · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {
@@ -516,6 +605,7 @@ mod tests {
                 text: "**Done**\n\n- [link](https://example.com)".to_string(),
             }],
             60,
+            PreviewVerbosity::Full,
         );
         let spans = lines
             .iter()
@@ -529,5 +619,53 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.text.contains("link") && span.link.as_deref() == Some("https://example.com")
         }));
+    }
+
+    #[test]
+    fn preview_verbosity_filters_only_assistant_detail_levels() {
+        let messages = [
+            MessageEntry {
+                id: "user".to_string(),
+                kind: MessageKind::User,
+                text: "Prompt".to_string(),
+            },
+            MessageEntry {
+                id: "thinking".to_string(),
+                kind: MessageKind::Thinking,
+                text: "Reasoning".to_string(),
+            },
+            MessageEntry {
+                id: "progress".to_string(),
+                kind: MessageKind::Progress,
+                text: "Working".to_string(),
+            },
+            MessageEntry {
+                id: "final".to_string(),
+                kind: MessageKind::Final,
+                text: "Done".to_string(),
+            },
+        ];
+
+        let progress = message_lines(&messages, 60, PreviewVerbosity::Progress);
+        let progress_text = progress
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(progress_text.contains("Prompt"));
+        assert!(!progress_text.contains("Reasoning"));
+        assert!(progress_text.contains("Working"));
+        assert!(progress_text.contains("Done"));
+
+        let final_only = message_lines(&messages, 60, PreviewVerbosity::Final);
+        let final_text = final_only
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(final_text.contains("Prompt"));
+        assert!(!final_text.contains("Reasoning"));
+        assert!(!final_text.contains("Working"));
+        assert!(final_text.contains("Done"));
     }
 }

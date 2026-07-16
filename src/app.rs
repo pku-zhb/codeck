@@ -9,7 +9,9 @@ use serde_json::{Map, Value, json};
 use crate::client::{ClientEvent, RpcSender};
 use crate::clipboard::{image_paths_from_paste, save_clipboard_image};
 use crate::lifecycle::LifecycleStore;
-use crate::model::{ComposeTarget, Composer, MessageEntry, MessageKind, Session, SessionStatus};
+use crate::model::{
+    ComposeTarget, Composer, MessageEntry, MessageKind, PreviewVerbosity, Session, SessionStatus,
+};
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -113,6 +115,9 @@ pub struct App {
     message_view_height: usize,
     attach_requested: Option<AttachRequest>,
     attach_right_armed: bool,
+    settings_open: bool,
+    settings_selection: PreviewVerbosity,
+    settings_left_armed: bool,
     rename_previous: Option<Composer>,
     rename_thread_id: Option<String>,
 }
@@ -127,6 +132,7 @@ impl App {
     }
 
     fn with_lifecycle(cwd: PathBuf, show_all: bool, lifecycle: LifecycleStore) -> Self {
+        let settings_selection = lifecycle.preview_verbosity();
         Self {
             cwd,
             show_all,
@@ -151,6 +157,9 @@ impl App {
             message_view_height: 1,
             attach_requested: None,
             attach_right_armed: false,
+            settings_open: false,
+            settings_selection,
+            settings_left_armed: false,
             rename_previous: None,
             rename_thread_id: None,
         }
@@ -207,6 +216,15 @@ impl App {
             return Ok(());
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Ok(());
+        }
+
+        if self.settings_open {
+            return self.handle_settings_key(key);
+        }
+
         let attach_right = key.code == KeyCode::Right
             && self.composer.text.is_empty()
             && self.composer.target != ComposeTarget::Rename
@@ -216,6 +234,15 @@ impl App {
         if !attach_right {
             self.attach_right_armed = false;
         }
+        let settings_left = key.code == KeyCode::Left
+            && self.composer.text.is_empty()
+            && self.composer.target != ComposeTarget::Rename
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !settings_left {
+            self.settings_left_armed = false;
+        }
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
             self.paste_clipboard_image();
@@ -224,10 +251,6 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    return Ok(());
-                }
                 KeyCode::Char('n') => {
                     self.cancel_rename();
                     self.switch_to_new_draft();
@@ -289,6 +312,8 @@ impl App {
             }
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
+            KeyCode::Left if settings_left && key.kind == KeyEventKind::Repeat => {}
+            KeyCode::Left if settings_left => self.confirm_settings()?,
             KeyCode::Left => self.composer.move_left(),
             KeyCode::Right if attach_right && key.kind == KeyEventKind::Repeat => {}
             KeyCode::Right if attach_right => self.confirm_attach()?,
@@ -313,6 +338,9 @@ impl App {
     }
 
     pub fn insert_paste(&mut self, text: &str) {
+        if self.settings_open {
+            return;
+        }
         if text.is_empty() {
             self.paste_clipboard_image();
             return;
@@ -439,6 +467,18 @@ impl App {
         self.selected_session()
             .map(|session| self.has_pending_request(&session.id))
             .unwrap_or(false)
+    }
+
+    pub fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    pub fn preview_verbosity(&self) -> PreviewVerbosity {
+        self.lifecycle.preview_verbosity()
+    }
+
+    pub fn settings_selection(&self) -> PreviewVerbosity {
+        self.settings_selection
     }
 
     fn handle_protocol_message(
@@ -1342,6 +1382,71 @@ impl App {
         }
     }
 
+    fn confirm_settings(&mut self) -> Result<()> {
+        if self.settings_left_armed {
+            self.settings_left_armed = false;
+            self.attach_right_armed = false;
+            self.settings_selection = self.lifecycle.preview_verbosity();
+            self.settings_open = true;
+            self.notice.clear();
+        } else {
+            self.settings_left_armed = true;
+            self.notice = "Press ← again for settings".to_string();
+        }
+        Ok(())
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
+        let settings_left = key.code == KeyCode::Left
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !settings_left {
+            self.settings_left_armed = false;
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.settings_selection = match self.settings_selection {
+                    PreviewVerbosity::Full => PreviewVerbosity::Full,
+                    PreviewVerbosity::Progress => PreviewVerbosity::Full,
+                    PreviewVerbosity::Final => PreviewVerbosity::Progress,
+                };
+            }
+            KeyCode::Down => {
+                self.settings_selection = match self.settings_selection {
+                    PreviewVerbosity::Full => PreviewVerbosity::Progress,
+                    PreviewVerbosity::Progress => PreviewVerbosity::Final,
+                    PreviewVerbosity::Final => PreviewVerbosity::Final,
+                };
+            }
+            KeyCode::Enter => {
+                self.lifecycle
+                    .set_preview_verbosity(self.settings_selection);
+                self.lifecycle.save().context("save deck settings")?;
+                self.settings_open = false;
+                self.settings_left_armed = false;
+                self.scroll_back = 0;
+                self.notice = format!(
+                    "Preview verbosity: {}",
+                    preview_verbosity_name(self.settings_selection)
+                );
+            }
+            KeyCode::Left if settings_left && key.kind == KeyEventKind::Repeat => {}
+            KeyCode::Left if settings_left && self.settings_left_armed => {
+                self.settings_open = false;
+                self.settings_left_armed = false;
+                self.settings_selection = self.lifecycle.preview_verbosity();
+                self.notice = "Settings unchanged".to_string();
+            }
+            KeyCode::Left if settings_left => {
+                self.settings_left_armed = true;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn toggle_compose_target(&mut self) {
         if self.composer.target == ComposeTarget::Rename {
             self.cancel_rename();
@@ -1589,6 +1694,14 @@ impl App {
         self.pending_requests
             .iter()
             .any(|request| request.thread_id == thread_id)
+    }
+}
+
+fn preview_verbosity_name(verbosity: PreviewVerbosity) -> &'static str {
+    match verbosity {
+        PreviewVerbosity::Full => "Full",
+        PreviewVerbosity::Progress => "Progress",
+        PreviewVerbosity::Final => "Final",
     }
 }
 
@@ -2129,6 +2242,71 @@ mod tests {
                 .thread_id,
             "thread-123"
         );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn settings_requires_two_left_presses_and_persists_preview_verbosity() {
+        let (mut app, state_path) = test_app(true);
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("first left");
+        assert!(!app.settings_open());
+        app.handle_key(
+            KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat),
+            &mut sender,
+        )
+        .expect("held left");
+        assert!(!app.settings_open());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("second left");
+        assert!(app.settings_open());
+        assert_eq!(app.settings_selection(), PreviewVerbosity::Full);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("select progress");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("save settings");
+        assert!(!app.settings_open());
+        assert_eq!(app.preview_verbosity(), PreviewVerbosity::Progress);
+
+        let restored = LifecycleStore::for_test(state_path.clone());
+        assert_eq!(restored.preview_verbosity(), PreviewVerbosity::Progress);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn left_arrow_keeps_editing_nonempty_composer() {
+        let (mut app, state_path) = test_app(true);
+        let mut sender = test_sender();
+        app.insert_text("abc");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("move left once");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("move left twice");
+
+        assert!(!app.settings_open());
+        assert_eq!(app.composer.cursor, 1);
         let _ = std::fs::remove_file(state_path);
     }
 

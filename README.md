@@ -49,6 +49,8 @@ codex-deck --check
 ## Keys
 
 - `Up` / `Down`: select a session
+- `Left`, twice consecutively: open Settings when the composer is empty;
+  choose preview verbosity with `Up` / `Down` and save with `Enter`
 - `Right`, twice consecutively: attach the selected session in the native Codex
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
@@ -85,6 +87,11 @@ emphasis, lists, quotes, inline/fenced code, task lists, tables, and links get
 distinct ANSI styles. Absolute local paths plus `http`, `https`, `file`, and
 `mailto` Markdown targets are emitted as OSC 8 hyperlinks without exposing the
 target in the visible text.
+
+Settings offers three persistent preview levels: `🧠 Full` shows thinking,
+progress, and final replies; `💬 Progress` hides thinking; `✅ Final` shows only
+final replies. User prompts, questions, and system errors remain visible at
+every level. Press `Left` twice again to leave Settings without saving.
 
 When Codex requests approval, reply with `y` (once), `a` (session), or `n`.
 When Codex asks several questions, separate answers with `|`.
