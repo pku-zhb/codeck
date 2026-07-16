@@ -407,11 +407,11 @@ impl App {
                 self.initial_load_complete = true;
                 self.ensure_selected_history(sender)?;
                 if first_load {
-                    self.notice = if self.sessions.is_empty() {
-                        "Type a task and press Enter".to_string()
+                    if self.sessions.is_empty() {
+                        self.notice = "Type a task and press Enter".to_string();
                     } else {
-                        self.session_summary()
-                    };
+                        self.notice.clear();
+                    }
                 }
             }
             PendingCall::ThreadRead { thread_id } => {
@@ -1321,21 +1321,6 @@ impl App {
         self.scroll_back = 0;
         self.notice = "Reviewed session removed from the deck; Codex history was kept".to_string();
         self.ensure_selected_history(sender)
-    }
-
-    fn session_summary(&self) -> String {
-        let pinned = self
-            .sessions
-            .iter()
-            .filter(|session| self.lifecycle.is_pinned(&session.id))
-            .count();
-        let working = self
-            .sessions
-            .iter()
-            .filter(|session| !self.lifecycle.is_pinned(&session.id) && session.status.is_live())
-            .count();
-        let completed = self.sessions.len().saturating_sub(pinned + working);
-        format!("{pinned} pinned · {working} working · {completed} completed")
     }
 
     pub fn is_pinned(&self, thread_id: &str) -> bool {
