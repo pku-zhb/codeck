@@ -69,6 +69,19 @@ struct ListState {
     next: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TableState {
+    rows: Vec<TableRow>,
+    current_row: Option<TableRow>,
+    in_head: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TableRow {
+    cells: Vec<StyledLine>,
+    is_header: bool,
+}
+
 struct MarkdownBuilder {
     lines: Vec<StyledLine>,
     current: StyledLine,
@@ -80,10 +93,12 @@ struct MarkdownBuilder {
     quote_depth: usize,
     code_depth: usize,
     table_cell: usize,
+    table: Option<TableState>,
+    render_width: usize,
 }
 
 impl MarkdownBuilder {
-    fn new(base_style: Style) -> Self {
+    fn new(base_style: Style, render_width: usize) -> Self {
         Self {
             lines: Vec::new(),
             current: StyledLine::default(),
@@ -95,6 +110,8 @@ impl MarkdownBuilder {
             quote_depth: 0,
             code_depth: 0,
             table_cell: 0,
+            table: None,
+            render_width,
         }
     }
 
@@ -209,18 +226,42 @@ impl MarkdownBuilder {
                     None,
                 );
             }
-            Tag::Table(_) => self.begin_block(),
-            Tag::TableHead => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
-            Tag::TableRow => {
+            Tag::Table(_) => {
                 self.begin_block();
-                self.table_cell = 0;
+                self.table = Some(TableState::default());
+            }
+            Tag::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.in_head = true;
+                    table.current_row.get_or_insert_with(|| TableRow {
+                        cells: Vec::new(),
+                        is_header: true,
+                    });
+                }
+                self.push_style(Style::default().add_modifier(Modifier::BOLD));
+            }
+            Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.current_row = Some(TableRow {
+                        cells: Vec::new(),
+                        is_header: table.in_head,
+                    });
+                    self.current = StyledLine::default();
+                } else {
+                    self.begin_block();
+                    self.table_cell = 0;
+                }
             }
             Tag::TableCell => {
-                if self.table_cell > 0 {
-                    self.current
-                        .push(" │ ", Style::default().fg(Color::DarkGray), None);
+                if self.table.is_some() {
+                    self.current = StyledLine::default();
+                } else {
+                    if self.table_cell > 0 {
+                        self.current
+                            .push(" │ ", Style::default().fg(Color::DarkGray), None);
+                    }
+                    self.table_cell += 1;
                 }
-                self.table_cell += 1;
             }
             Tag::DefinitionList => self.begin_block(),
             Tag::DefinitionListTitle => {
@@ -260,16 +301,49 @@ impl MarkdownBuilder {
             | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript
-            | TagEnd::TableHead
             | TagEnd::DefinitionListTitle => self.pop_style(),
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    if let Some(row) = table.current_row.take()
+                        && !row.cells.is_empty()
+                    {
+                        table.rows.push(row);
+                    }
+                    table.in_head = false;
+                }
+                self.pop_style();
+            }
             TagEnd::Link | TagEnd::Image => {
                 self.link = self.link_stack.pop().flatten();
                 self.pop_style();
             }
-            TagEnd::TableRow => self.flush_line(),
-            TagEnd::Table => self.flush_line(),
-            TagEnd::TableCell
-            | TagEnd::DefinitionList
+            TagEnd::TableRow => {
+                if let Some(table) = &mut self.table {
+                    if let Some(row) = table.current_row.take() {
+                        table.rows.push(row);
+                    }
+                } else {
+                    self.flush_line();
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.lines.extend(render_table(table, self.render_width));
+                } else {
+                    self.flush_line();
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table {
+                    let is_header = table.in_head;
+                    let row = table.current_row.get_or_insert_with(|| TableRow {
+                        cells: Vec::new(),
+                        is_header,
+                    });
+                    row.cells.push(std::mem::take(&mut self.current));
+                }
+            }
+            TagEnd::DefinitionList
             | TagEnd::DefinitionListDefinition
             | TagEnd::HtmlBlock
             | TagEnd::MetadataBlock(_) => {}
@@ -320,6 +394,7 @@ impl MarkdownBuilder {
                     None,
                 );
             }
+            Event::SoftBreak if self.table.is_some() => self.push(" "),
             Event::SoftBreak if self.code_depth > 0 || self.current_is_field_record() => {
                 self.continue_line();
             }
@@ -374,12 +449,18 @@ impl MarkdownBuilder {
     }
 
     fn begin_block(&mut self) {
+        if self.table.is_some() {
+            return;
+        }
         if !self.current.spans.is_empty() {
             self.flush_line();
         }
     }
 
     fn flush_line(&mut self) {
+        if self.table.is_some() {
+            return;
+        }
         if self.current.spans.is_empty() {
             return;
         }
@@ -421,11 +502,12 @@ pub fn render_markdown(text: &str, base_style: Style, width: usize) -> Vec<Style
         | Options::ENABLE_TABLES
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
-    let mut builder = MarkdownBuilder::new(base_style);
+    let width = width.max(1);
+    let mut builder = MarkdownBuilder::new(base_style, width);
     for event in Parser::new_ext(text, options) {
         builder.event(event);
     }
-    let lines = wrap_lines(builder.finish(), width.max(1));
+    let lines = wrap_lines(builder.finish(), width);
     highlight_field_labels(lines)
 }
 
@@ -457,6 +539,111 @@ pub fn apply_osc8_links(frame: &mut Frame<'_>, area: Rect, lines: &[StyledLine])
             }
         }
     }
+}
+
+fn render_table(table: TableState, width: usize) -> Vec<StyledLine> {
+    if table.rows.is_empty() {
+        return Vec::new();
+    }
+    let compact = compact_table_lines(&table);
+    if compact.iter().all(|line| line.width() <= width) {
+        return compact;
+    }
+    record_table_lines(&table, width)
+}
+
+fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            let mut line = StyledLine::default();
+            for (index, cell) in row.cells.iter().enumerate() {
+                if index > 0 {
+                    line.push(" │ ", Style::default().fg(Color::DarkGray), None);
+                }
+                for span in &cell.spans {
+                    line.push(span.text.clone(), span.style, span.link.clone());
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
+    let header_index = table
+        .rows
+        .iter()
+        .position(|row| row.is_header)
+        .unwrap_or_default();
+    let headers = &table.rows[header_index];
+    let mut output = Vec::new();
+    let rows = table
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| *index != header_index && !row.is_header)
+        .collect::<Vec<_>>();
+
+    for (row_position, (_, row)) in rows.iter().enumerate() {
+        let before = output.len();
+        for (index, cell) in row.cells.iter().enumerate() {
+            if cell_is_empty(cell) {
+                continue;
+            }
+            let label = table_header_label(headers.cells.get(index), index);
+            let mut line = StyledLine::default();
+            line.push(
+                format!("{label}:"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                None,
+            );
+            line.push(" ", Style::default(), None);
+            for span in &cell.spans {
+                line.push(span.text.clone(), span.style, span.link.clone());
+            }
+            output.push(line);
+        }
+        if output.len() > before && row_position + 1 < rows.len() {
+            output.push(StyledLine::from_span(
+                "─".repeat(width.min(80).max(1)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    if output.is_empty() {
+        compact_table_lines(table)
+    } else {
+        output
+    }
+}
+
+fn table_header_label(cell: Option<&StyledLine>, index: usize) -> String {
+    cell.map(plain_text)
+        .map(|label| {
+            label
+                .trim()
+                .trim_end_matches([':', '：'])
+                .trim()
+                .to_string()
+        })
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| format!("Column {}", index + 1))
+}
+
+fn plain_text(line: &StyledLine) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<String>()
+}
+
+fn cell_is_empty(line: &StyledLine) -> bool {
+    plain_text(line).trim().is_empty()
 }
 
 fn wrap_lines(lines: Vec<StyledLine>, width: usize) -> Vec<StyledLine> {
@@ -683,9 +870,63 @@ mod tests {
     }
 
     #[test]
+    fn markdown_renders_wide_tables_as_field_records() {
+        let lines = render_markdown(
+            "| 公司 | 代码 | 核心逻辑 |\n\
+             | --- | --- | --- |\n\
+             | 英伟达 | NVDA | 数据中心 GPU 需求持续超预期，Blackwell 架构爬坡顺利 |",
+            Style::default(),
+            28,
+        );
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line == "公司: 英伟达"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "代码: NVDA"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with("核心逻辑:")),
+            "rendered={rendered:?}"
+        );
+        assert!(!rendered.iter().any(|line| line.contains("公司 │ 代码")));
+
+        let label = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text == "公司:")
+            .expect("field label");
+        assert_eq!(label.style.fg, Some(Color::Cyan));
+        assert!(label.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_keeps_narrow_tables_compact() {
+        let lines = render_markdown(
+            "| 公司 | 代码 |\n| --- | --- |\n| 英伟达 | NVDA |",
+            Style::default(),
+            80,
+        );
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line == "公司 │ 代码"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "英伟达 │ NVDA"),
+            "rendered={rendered:?}"
+        );
+        assert!(!rendered.iter().any(|line| line == "公司: 英伟达"));
+    }
+
+    #[test]
     fn markdown_does_not_highlight_urls_or_code_block_fields() {
         let lines = render_markdown(
-            "https://example.com/path\n\n```text\n公司：英伟达\n```",
+            "https://example.com/path\n\n```text\n公司：英伟达\n```\n\n```markdown\n| 公司 | 代码 |\n| --- | --- |\n| 英伟达 | NVDA |\n```",
             Style::default(),
             80,
         );
@@ -698,6 +939,9 @@ mod tests {
 
         assert!(!highlighted.iter().any(|text| *text == "https:"));
         assert!(!highlighted.iter().any(|text| *text == "公司："));
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        assert!(rendered.iter().any(|line| line.contains("| 公司 | 代码 |")));
+        assert!(!rendered.iter().any(|line| line == "公司: 英伟达"));
     }
 
     #[test]
