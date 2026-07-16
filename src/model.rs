@@ -316,6 +316,14 @@ impl Composer {
             .unwrap_or(self.text.len());
     }
 
+    pub fn move_to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_to_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
     pub fn prompt_text(&self) -> String {
         let mut text = self.text.clone();
         let mut images = self

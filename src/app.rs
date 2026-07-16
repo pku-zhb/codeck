@@ -16,6 +16,7 @@ use crate::model::{
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DOUBLE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const THREAD_SOURCE: &str = "codeck";
 const LEGACY_THREAD_SOURCE: &str = "codex-deck";
 
@@ -34,6 +35,10 @@ enum PendingCall {
     ThreadResumeForReply {
         thread_id: String,
         draft: PromptDraft,
+    },
+    ThreadFork {
+        source_thread_id: String,
+        name: String,
     },
     TurnStart {
         thread_id: String,
@@ -143,6 +148,7 @@ enum CtrlXAction {
 struct CtrlXConfirmation {
     thread_id: String,
     action: CtrlXAction,
+    armed_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -180,11 +186,11 @@ pub struct App {
     scroll_back: usize,
     message_view_height: usize,
     attach_requested: Option<AttachRequest>,
-    attach_right_armed: bool,
+    attach_right_armed: Option<Instant>,
     settings_open: bool,
     menu_tab: MenuTab,
     settings_selection: PreviewVerbosity,
-    settings_left_armed: bool,
+    settings_left_armed: Option<Instant>,
     force_full_redraw: bool,
     ctrl_x_armed: Option<CtrlXConfirmation>,
     rename_previous: Option<Composer>,
@@ -230,11 +236,11 @@ impl App {
             scroll_back: 0,
             message_view_height: 1,
             attach_requested: None,
-            attach_right_armed: false,
+            attach_right_armed: None,
             settings_open: false,
             menu_tab: MenuTab::Resume,
             settings_selection,
-            settings_left_armed: false,
+            settings_left_armed: None,
             force_full_redraw: false,
             ctrl_x_armed: None,
             rename_previous: None,
@@ -261,6 +267,7 @@ impl App {
     }
 
     pub fn tick(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        self.expire_double_confirmations();
         if self.initialized
             && !self.list_inflight
             && self.last_refresh.elapsed() >= REFRESH_INTERVAL
@@ -268,6 +275,22 @@ impl App {
             self.request_thread_list(sender)?;
         }
         Ok(())
+    }
+
+    fn expire_double_confirmations(&mut self) {
+        if !confirmation_recent(self.attach_right_armed) {
+            self.attach_right_armed = None;
+        }
+        if !confirmation_recent(self.settings_left_armed) {
+            self.settings_left_armed = None;
+        }
+        if self
+            .ctrl_x_armed
+            .as_ref()
+            .is_some_and(|confirmation| !confirmation_recent(Some(confirmation.armed_at)))
+        {
+            self.ctrl_x_armed = None;
+        }
     }
 
     pub fn handle_client_event(
@@ -292,14 +315,14 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(());
         }
+        self.expire_double_confirmations();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key_char_eq(&key, 'c') {
             self.should_quit = true;
             return Ok(());
         }
 
-        let is_ctrl_x =
-            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x');
+        let is_ctrl_x = key.modifiers.contains(KeyModifiers::CONTROL) && key_char_eq(&key, 'x');
         if !is_ctrl_x {
             self.ctrl_x_armed = None;
         }
@@ -319,7 +342,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !attach_right {
-            self.attach_right_armed = false;
+            self.attach_right_armed = None;
         }
         let settings_left = key.code == KeyCode::Left
             && self.composer.text.is_empty()
@@ -328,7 +351,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !settings_left {
-            self.settings_left_armed = false;
+            self.settings_left_armed = None;
         }
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
@@ -351,6 +374,16 @@ impl App {
                     self.start_rename();
                     return Ok(());
                 }
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'a') => {
+                    self.composer.move_to_start();
+                    self.skill_picker = None;
+                    return Ok(());
+                }
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'e') => {
+                    self.composer.move_to_end();
+                    self.skill_picker = None;
+                    return Ok(());
+                }
                 KeyCode::Char('u') => {
                     self.composer.reset();
                     self.skill_picker = None;
@@ -366,7 +399,7 @@ impl App {
                     self.toggle_pin_selected()?;
                     return Ok(());
                 }
-                KeyCode::Char('x') => {
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'x') => {
                     self.skill_picker = None;
                     self.confirm_stop_or_remove(key.kind, sender)?;
                     return Ok(());
@@ -410,8 +443,8 @@ impl App {
             KeyCode::Right if attach_right && key.kind == KeyEventKind::Repeat => {}
             KeyCode::Right if attach_right => self.confirm_attach()?,
             KeyCode::Right => self.composer.move_right(),
-            KeyCode::Home => self.composer.cursor = 0,
-            KeyCode::End => self.composer.cursor = self.composer.text.len(),
+            KeyCode::Home => self.composer.move_to_start(),
+            KeyCode::End => self.composer.move_to_end(),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -426,7 +459,7 @@ impl App {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        self.attach_right_armed = false;
+        self.attach_right_armed = None;
         self.skill_picker = None;
         self.composer.insert(text);
     }
@@ -472,7 +505,7 @@ impl App {
             self.composer.attach_image(path);
         }
         let added = self.composer.images.len().saturating_sub(before);
-        self.attach_right_armed = false;
+        self.attach_right_armed = None;
         self.notice = if added == 0 {
             "Image is already attached".to_string()
         } else {
@@ -536,7 +569,8 @@ impl App {
         let confirmation = self
             .ctrl_x_armed
             .as_ref()
-            .filter(|confirmation| confirmation.thread_id == thread_id)?;
+            .filter(|confirmation| confirmation.thread_id == thread_id)
+            .filter(|confirmation| confirmation_recent(Some(confirmation.armed_at)))?;
         Some(match confirmation.action {
             CtrlXAction::Pause => "Ctrl+X again: pause",
             CtrlXAction::Remove => "Ctrl+X again: remove",
@@ -764,6 +798,38 @@ impl App {
                 } else {
                     self.start_turn(&thread_id, &draft, sender)?;
                 }
+            }
+            PendingCall::ThreadFork {
+                source_thread_id,
+                name,
+            } => {
+                let thread = result
+                    .get("thread")
+                    .context("thread/fork response missing thread")?;
+                let session = Session::from_thread(thread)
+                    .context("thread/fork response has invalid thread")?;
+                let thread_id = session.id.clone();
+                self.track_session(&thread_id)?;
+                self.merge_session(session);
+                self.apply_thread_history(&thread_id, thread);
+                self.select_session(&thread_id);
+                self.load_reply_draft(&thread_id);
+                self.scroll_back = 0;
+                let id = sender.request(
+                    "thread/name/set",
+                    json!({ "threadId": thread_id.clone(), "name": name }),
+                )?;
+                if let Some(session) = self.session_mut(&thread_id) {
+                    session.title = name.clone();
+                }
+                self.pending_calls.insert(
+                    id,
+                    PendingCall::ThreadNameSet {
+                        thread_id: thread_id.clone(),
+                        name: name.clone(),
+                    },
+                );
+                self.notice = format!("Forked {} as {name}", self.session_title(&source_thread_id));
             }
             PendingCall::TurnStart { thread_id } => {
                 if let Some(turn_id) = result
@@ -1089,6 +1155,16 @@ impl App {
             return Ok(());
         }
 
+        if text == "/fork" {
+            if !self.composer.images.is_empty() {
+                self.notice = "/fork does not accept attached images".to_string();
+                return Ok(());
+            }
+            self.composer.reset();
+            self.cache_current_draft();
+            return self.fork_selected_session(sender);
+        }
+
         if target == ComposeTarget::Reply
             && let Some(thread_id) = self.selected_session().map(|session| session.id.clone())
             && self.has_pending_request(&thread_id)
@@ -1164,6 +1240,35 @@ impl App {
             }
             ComposeTarget::Rename => unreachable!("rename handled above"),
         }
+        Ok(())
+    }
+
+    fn fork_selected_session(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        let Some((thread_id, title)) = self
+            .selected_session()
+            .map(|session| (session.id.clone(), session.title.clone()))
+        else {
+            self.notice = "No session selected to fork".to_string();
+            return Ok(());
+        };
+        self.track_session(&thread_id)?;
+        let name = self.next_fork_title(&title);
+        let id = sender.request(
+            "thread/fork",
+            json!({
+                "threadId": thread_id,
+                "threadSource": THREAD_SOURCE,
+                "ephemeral": false
+            }),
+        )?;
+        self.pending_calls.insert(
+            id,
+            PendingCall::ThreadFork {
+                source_thread_id: thread_id,
+                name: name.clone(),
+            },
+        );
+        self.notice = format!("Forking {title} as {name}…");
         Ok(())
     }
 
@@ -1580,7 +1685,7 @@ impl App {
     }
 
     fn request_attach(&mut self) -> Result<()> {
-        self.attach_right_armed = false;
+        self.attach_right_armed = None;
         let Some((thread_id, cwd)) = self
             .selected_session()
             .map(|session| (session.id.clone(), session.cwd.clone()))
@@ -1602,19 +1707,19 @@ impl App {
     }
 
     fn confirm_attach(&mut self) -> Result<()> {
-        if self.attach_right_armed {
+        if confirmation_recent(self.attach_right_armed) {
             self.request_attach()
         } else {
-            self.attach_right_armed = true;
+            self.attach_right_armed = Some(Instant::now());
             self.notice = "Press → again to attach".to_string();
             Ok(())
         }
     }
 
     fn confirm_settings(&mut self) -> Result<()> {
-        if self.settings_left_armed {
-            self.settings_left_armed = false;
-            self.attach_right_armed = false;
+        if confirmation_recent(self.settings_left_armed) {
+            self.settings_left_armed = None;
+            self.attach_right_armed = None;
             self.settings_selection = self.lifecycle.preview_verbosity();
             self.menu_tab = MenuTab::Resume;
             self.history_picker = Some(HistoryPicker {
@@ -1625,7 +1730,7 @@ impl App {
             self.force_full_redraw = true;
             self.notice.clear();
         } else {
-            self.settings_left_armed = true;
+            self.settings_left_armed = Some(Instant::now());
             self.notice = "Press ← again for settings".to_string();
         }
         Ok(())
@@ -1794,7 +1899,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !settings_left {
-            self.settings_left_armed = false;
+            self.settings_left_armed = None;
         }
 
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1802,7 +1907,7 @@ impl App {
                 MenuTab::Resume => MenuTab::Settings,
                 MenuTab::Settings => MenuTab::Resume,
             };
-            self.settings_left_armed = false;
+            self.settings_left_armed = None;
             self.force_full_redraw = true;
             return Ok(());
         }
@@ -1810,9 +1915,9 @@ impl App {
         if settings_left && key.kind == KeyEventKind::Repeat {
             return Ok(());
         }
-        if settings_left && self.settings_left_armed {
+        if settings_left && confirmation_recent(self.settings_left_armed) {
             self.settings_open = false;
-            self.settings_left_armed = false;
+            self.settings_left_armed = None;
             self.history_picker = None;
             self.settings_selection = self.lifecycle.preview_verbosity();
             self.force_full_redraw = true;
@@ -1820,7 +1925,7 @@ impl App {
             return Ok(());
         }
         if settings_left {
-            self.settings_left_armed = true;
+            self.settings_left_armed = Some(Instant::now());
             return Ok(());
         }
 
@@ -1852,7 +1957,7 @@ impl App {
                     .set_preview_verbosity(self.settings_selection);
                 self.lifecycle.save().context("save Codeck settings")?;
                 self.settings_open = false;
-                self.settings_left_armed = false;
+                self.settings_left_armed = None;
                 self.history_picker = None;
                 self.force_full_redraw = true;
                 self.scroll_back = 0;
@@ -1933,7 +2038,7 @@ impl App {
         self.select_session(&thread_id);
         self.load_reply_draft(&thread_id);
         self.settings_open = false;
-        self.settings_left_armed = false;
+        self.settings_left_armed = None;
         self.history_picker = None;
         self.force_full_redraw = true;
         self.scroll_back = 0;
@@ -2139,8 +2244,13 @@ impl App {
         let confirmation = CtrlXConfirmation {
             thread_id: session.id.clone(),
             action,
+            armed_at: Instant::now(),
         };
-        if self.ctrl_x_armed.as_ref() == Some(&confirmation) {
+        if self.ctrl_x_armed.as_ref().is_some_and(|armed| {
+            armed.thread_id == confirmation.thread_id
+                && armed.action == confirmation.action
+                && confirmation_recent(Some(armed.armed_at))
+        }) {
             self.ctrl_x_armed = None;
             return self.stop_or_remove_selected(sender);
         }
@@ -2176,6 +2286,18 @@ impl App {
         self.session(thread_id)
             .map(|session| session.title.clone())
             .unwrap_or_else(|| "session".to_string())
+    }
+
+    fn next_fork_title(&self, title: &str) -> String {
+        let base = fork_title_base(title.trim());
+        let max_suffix = self
+            .sessions
+            .iter()
+            .chain(self.history_sessions.iter())
+            .filter_map(|session| fork_title_suffix(&session.title, &base))
+            .max()
+            .unwrap_or(1);
+        format!("{base} ({})", max_suffix.saturating_add(1))
     }
 
     fn select_session(&mut self, thread_id: &str) {
@@ -2475,6 +2597,40 @@ fn active_turn_id(thread: &Value) -> Option<String> {
         .and_then(|turn| turn.get("id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn confirmation_recent(armed_at: Option<Instant>) -> bool {
+    armed_at.is_some_and(|armed_at| armed_at.elapsed() <= DOUBLE_CONFIRM_TIMEOUT)
+}
+
+fn key_char_eq(key: &KeyEvent, expected: char) -> bool {
+    matches!(key.code, KeyCode::Char(character) if character.eq_ignore_ascii_case(&expected))
+}
+
+fn fork_title_base(title: &str) -> String {
+    let title = if title.is_empty() { "Fork" } else { title };
+    let Some(prefix) = title.strip_suffix(')') else {
+        return title.to_string();
+    };
+    let Some(start) = prefix.rfind(" (") else {
+        return title.to_string();
+    };
+    if prefix[start + 2..].chars().all(|ch| ch.is_ascii_digit()) {
+        prefix[..start].to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn fork_title_suffix(title: &str, base: &str) -> Option<usize> {
+    if title == base {
+        return Some(1);
+    }
+    let suffix = title
+        .strip_prefix(base)?
+        .strip_prefix(" (")?
+        .strip_suffix(')')?;
+    suffix.parse::<usize>().ok().filter(|suffix| *suffix >= 2)
 }
 
 fn parse_questions(params: &Value) -> Vec<InputQuestion> {
@@ -2860,6 +3016,14 @@ mod tests {
         )
         .expect("held right");
         assert!(app.take_attach_request().is_none());
+        app.attach_right_armed =
+            Some(Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("expired right re-arms");
+        assert!(app.take_attach_request().is_none());
 
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -2903,6 +3067,14 @@ mod tests {
             &mut sender,
         )
         .expect("held left");
+        assert!(!app.settings_open());
+        app.settings_left_armed =
+            Some(Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("expired left re-arms");
         assert!(!app.settings_open());
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -3019,6 +3191,28 @@ mod tests {
 
         assert!(!app.settings_open());
         assert_eq!(app.composer.cursor, 1);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_move_the_composer_cursor() {
+        let (mut app, state_path) = test_app(true);
+        let mut sender = test_sender();
+        app.insert_text("ab中文");
+        app.composer.cursor = 2;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("move to start");
+        assert_eq!(app.composer.cursor, 0);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("move to end");
+        assert_eq!(app.composer.cursor, app.composer.text.len());
         let _ = std::fs::remove_file(state_path);
     }
 
@@ -3212,6 +3406,88 @@ mod tests {
 
         app.move_selection(-1, &mut sender).expect("select A");
         assert_eq!(app.composer.text, "reply for A");
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn slash_fork_forks_the_selected_session_and_focuses_the_new_thread() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-original",
+            "Original",
+            SessionStatus::Completed,
+        ));
+        app.sessions.push(test_session(
+            "thread-existing-fork",
+            "Original (2)",
+            SessionStatus::Completed,
+        ));
+        app.selected = 0;
+        app.composer.target = ComposeTarget::Reply;
+        app.insert_text("/fork");
+        let mut sender = test_sender();
+
+        app.submit(&mut sender).expect("submit fork command");
+
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/fork".to_string(),
+                json!({
+                    "threadId":"thread-original",
+                    "threadSource": THREAD_SOURCE,
+                    "ephemeral": false
+                })
+            ))
+        );
+        assert!(app.composer.text.is_empty());
+        assert!(app.lifecycle.contains("thread-original"));
+
+        app.handle_response(
+            json!({
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-new-fork",
+                        "name": "Original",
+                        "preview": "Forked preview",
+                        "cwd": "/tmp/thread-new-fork",
+                        "status": {"type": "idle"},
+                        "source": "appServer",
+                        "threadSource": THREAD_SOURCE,
+                        "turns": [{
+                            "id": "turn-1",
+                            "status": "completed",
+                            "items": [{
+                                "type": "userMessage",
+                                "id": "u1",
+                                "content": [{"type": "text", "text": "Original prompt"}]
+                            }]
+                        }]
+                    }
+                }
+            }),
+            &mut sender,
+        )
+        .expect("handle fork response");
+
+        assert_eq!(
+            app.selected_session().expect("selected fork").id,
+            "thread-new-fork"
+        );
+        assert_eq!(
+            app.selected_session().expect("renamed fork").title,
+            "Original (3)"
+        );
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert!(app.lifecycle.contains("thread-new-fork"));
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/name/set".to_string(),
+                json!({"threadId":"thread-new-fork","name":"Original (3)"})
+            ))
+        );
         let _ = std::fs::remove_file(state_path);
     }
 
@@ -3695,6 +3971,53 @@ mod tests {
             app.ctrl_x_confirmation("working-thread"),
             Some("Ctrl+X again: pause")
         );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_x_confirmation_expires_after_one_second() {
+        let (mut app, state_path) = test_app(false);
+        let mut session = test_session("working-thread", "Working", SessionStatus::Working);
+        session.active_turn_id = Some("turn-1".to_string());
+        app.sessions.push(session);
+        let mut sender = test_sender();
+        let ctrl_x = KeyEvent::new(KeyCode::Char('X'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_x, &mut sender).expect("arm pause");
+        app.ctrl_x_armed.as_mut().expect("armed ctrl-x").armed_at =
+            Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1);
+        app.handle_key(ctrl_x, &mut sender)
+            .expect("expired ctrl-x re-arms");
+
+        assert!(sender.requests.is_empty());
+        assert_eq!(
+            app.ctrl_x_confirmation("working-thread"),
+            Some("Ctrl+X again: pause")
+        );
+        app.handle_key(ctrl_x, &mut sender)
+            .expect("fresh ctrl-x confirms");
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "turn/interrupt".to_string(),
+                json!({"threadId":"working-thread","turnId":"turn-1"})
+            ))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_c_quits_with_uppercase_keycode() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("ctrl-c");
+
+        assert!(app.should_quit());
         let _ = std::fs::remove_file(state_path);
     }
 

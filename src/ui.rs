@@ -533,13 +533,12 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let pending = app.selected_has_pending_request();
     let prefix = composer_prefix(app.composer().target, pending);
-    let prefix_style = match app.composer().target {
-        ComposeTarget::NewTask => Style::default().fg(Color::Green),
-        ComposeTarget::Reply if pending => Style::default().fg(Color::Yellow),
-        ComposeTarget::Reply => Style::default().fg(Color::Cyan),
-        ComposeTarget::Rename => Style::default().fg(Color::Magenta),
-    }
-    .add_modifier(Modifier::BOLD);
+    let accent = composer_accent(app.composer().target, pending);
+    let background = composer_background(app.composer().target, pending);
+    let prefix_style = Style::default()
+        .fg(accent)
+        .bg(background)
+        .add_modifier(Modifier::BOLD);
     let (all_lines, cursor_row, cursor_col) = styled_composer_layout(
         &prefix,
         &app.composer().text,
@@ -553,21 +552,41 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .min(area.height.saturating_sub(1));
     let editor_height = area.height.saturating_sub(hint_height).max(1);
     let chunks = Layout::vertical([
-        Constraint::Length(editor_height),
+        Constraint::Length(u16::from(editor_height > 1)),
+        Constraint::Length(editor_height.saturating_sub(u16::from(editor_height > 1))),
         Constraint::Length(hint_height),
     ])
     .split(area);
-    let editor_area = chunks[0];
-    let hint_area = chunks[1];
+    let title_area = chunks[0];
+    let editor_area = chunks[1];
+    let hint_area = chunks[2];
     let offset = cursor_row.saturating_sub(editor_area.height.saturating_sub(1) as usize);
+
+    if title_area.height > 0 {
+        let title = composer_context_title(app, title_area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ", Style::default().bg(background)),
+                Span::styled(title, Style::default().fg(accent).bg(background)),
+            ]))
+            .style(Style::default().bg(background)),
+            title_area,
+        );
+    }
 
     let mut visible = Vec::new();
     for row in 0..editor_area.height as usize {
         let source_row = offset + row;
-        visible.push(all_lines.get(source_row).cloned().unwrap_or_default());
+        visible.push(line_with_bg(
+            all_lines.get(source_row).cloned().unwrap_or_default(),
+            background,
+        ));
     }
 
-    frame.render_widget(Paragraph::new(Text::from(visible)), editor_area);
+    frame.render_widget(
+        Paragraph::new(Text::from(visible)).style(Style::default().bg(background)),
+        editor_area,
+    );
     if hint_area.height > 0 {
         let hint_lines = wrapped_hint_lines(&hint, hint_area.width as usize)
             .into_iter()
@@ -585,6 +604,47 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .saturating_add(cursor_col as u16)
         .min(editor_area.right().saturating_sub(1));
     frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn composer_accent(target: ComposeTarget, pending: bool) -> Color {
+    match target {
+        ComposeTarget::NewTask => Color::Green,
+        ComposeTarget::Reply if pending => Color::Yellow,
+        ComposeTarget::Reply => Color::Cyan,
+        ComposeTarget::Rename => Color::Magenta,
+    }
+}
+
+fn composer_background(target: ComposeTarget, pending: bool) -> Color {
+    match target {
+        ComposeTarget::NewTask => Color::Rgb(4, 32, 18),
+        ComposeTarget::Reply if pending => Color::Rgb(42, 34, 6),
+        ComposeTarget::Reply => Color::Rgb(4, 28, 36),
+        ComposeTarget::Rename => Color::Rgb(34, 16, 42),
+    }
+}
+
+fn composer_context_title(app: &App, width: usize) -> String {
+    let label = match app.composer().target {
+        ComposeTarget::NewTask => "New task".to_string(),
+        ComposeTarget::Reply => app
+            .selected_session()
+            .map(|session| session.title.clone())
+            .unwrap_or_else(|| "No session selected".to_string()),
+        ComposeTarget::Rename => app
+            .selected_session()
+            .map(|session| format!("Rename: {}", session.title))
+            .unwrap_or_else(|| "Rename".to_string()),
+    };
+    truncate_display(&label, width.saturating_sub(2))
+}
+
+fn line_with_bg(mut line: Line<'static>, background: Color) -> Line<'static> {
+    for span in &mut line.spans {
+        span.style = span.style.bg(background);
+    }
+    line.style = line.style.bg(background);
+    line
 }
 
 fn composer_prefix(target: ComposeTarget, pending: bool) -> String {
@@ -609,7 +669,10 @@ fn composer_panel_height(prefix: &str, text: &str, hint: &str, width: usize, max
         .len()
         .min(maximum.saturating_sub(1) as usize) as u16;
     let editor_height = composer_height(prefix, text, width, maximum - hint_height);
-    editor_height.saturating_add(hint_height)
+    editor_height
+        .saturating_add(hint_height)
+        .saturating_add(1)
+        .min(maximum)
 }
 
 fn wrapped_hint_lines(hint: &str, width: usize) -> Vec<String> {
@@ -803,9 +866,9 @@ mod tests {
 
     #[test]
     fn composer_reserves_wrapped_hint_rows_below_the_cursor_while_typing() {
-        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 10), 3);
+        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 10), 4);
         assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 2), 2);
-        assert_eq!(composer_panel_height("> ", "typed", "1234567890", 5, 10), 4);
+        assert_eq!(composer_panel_height("> ", "typed", "1234567890", 5, 10), 5);
         assert_eq!(composer_panel_height("> ", "1234567890", "hint", 5, 3), 3);
     }
 
