@@ -403,18 +403,17 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
     } else {
         Style::default()
     };
-    let marker = if selected { "› " } else { "  " };
-    let title_style = if selected {
-        row_style.add_modifier(Modifier::BOLD)
-    } else if session.status == SessionStatus::NeedsInput {
-        row_style.fg(Color::Yellow)
-    } else if session.status == SessionStatus::Failed {
-        row_style.fg(Color::Red)
+    let working = session.status == SessionStatus::Working;
+    let lamp = if working { "● " } else { "  " };
+    let lamp_style = if working {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::SLOW_BLINK)
     } else {
-        row_style
+        Style::default()
     };
     let right = session.leaf_directory();
-    let prefix_width = UnicodeWidthStr::width(marker);
+    let prefix_width = UnicodeWidthStr::width(lamp);
     let right_width = UnicodeWidthStr::width(right.as_str());
     let title_budget = width
         .saturating_sub(prefix_width)
@@ -425,8 +424,8 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
     let spacer = " ".repeat(width.saturating_sub(used));
 
     Line::from(vec![
-        Span::styled(marker.to_string(), row_style),
-        Span::styled(title, title_style),
+        Span::styled(lamp.to_string(), lamp_style),
+        Span::styled(title, row_style),
         Span::styled(spacer, row_style),
         Span::styled(
             right,
@@ -854,7 +853,45 @@ mod tests {
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
         assert!(line.style.bg.is_none());
-        assert!(!line.spans.iter().any(|span| span.content.contains('●')));
+        assert!(!line.spans.iter().any(|span| span.content.contains('›')));
+        assert_eq!(line.spans[0].content, "● ");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+        assert!(
+            line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::SLOW_BLINK)
+        );
+    }
+
+    #[test]
+    fn non_working_sessions_reserve_lamp_space_without_showing_a_lamp() {
+        for status in [
+            SessionStatus::NeedsInput,
+            SessionStatus::Completed,
+            SessionStatus::Failed,
+        ] {
+            let session = Session {
+                id: "thread".to_string(),
+                title: "Idle session".to_string(),
+                preview: String::new(),
+                cwd: "/tmp/project".to_string(),
+                path: None,
+                updated_at: 0,
+                source: "appServer".to_string(),
+                thread_source: Some("codex-deck".to_string()),
+                status,
+                active_turn_id: None,
+                messages: Vec::new(),
+                history_loaded: true,
+            };
+
+            let line = session_line(&session, false, 40);
+            assert_eq!(line.spans[0].content, "  ");
+            assert!(!line.spans.iter().any(|span| span.content.contains('●')));
+            assert!(!line.spans.iter().any(|span| span.content.contains('›')));
+            assert_eq!(line.spans[1].style.fg, None);
+        }
     }
 
     #[test]
