@@ -41,9 +41,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(2)
         .max(1);
     let input_prefix = composer_prefix(app.composer().target, app.selected_has_pending_request());
-    let input_height = composer_height(
+    let hint = app.composer().text.is_empty().then(|| composer_hint(app));
+    let input_height = composer_panel_height(
         &input_prefix,
         &app.composer().text,
+        hint.as_deref(),
         area.width as usize,
         max_input_height,
     );
@@ -546,28 +548,49 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         prefix_style,
         area.width.max(1) as usize,
     );
-    let offset = cursor_row.saturating_sub(area.height.saturating_sub(1) as usize);
+    let editor_height = composer_height(
+        &prefix,
+        &app.composer().text,
+        area.width as usize,
+        area.height,
+    );
+    let hint_height = if app.composer().text.is_empty() {
+        area.height.saturating_sub(editor_height)
+    } else {
+        0
+    };
+    let chunks = Layout::vertical([
+        Constraint::Length(editor_height),
+        Constraint::Length(hint_height),
+    ])
+    .split(area);
+    let editor_area = chunks[0];
+    let hint_area = chunks[1];
+    let offset = cursor_row.saturating_sub(editor_area.height.saturating_sub(1) as usize);
 
     let mut visible = Vec::new();
-    for row in 0..area.height as usize {
+    for row in 0..editor_area.height as usize {
         let source_row = offset + row;
-        let mut line = all_lines.get(source_row).cloned().unwrap_or_default();
-        if source_row == 0 && app.composer().text.is_empty() {
-            line.spans
-                .push(Span::styled(composer_hint(app), dim_style()));
-        }
-        visible.push(line);
+        visible.push(all_lines.get(source_row).cloned().unwrap_or_default());
     }
 
-    frame.render_widget(Paragraph::new(Text::from(visible)), area);
-    let cursor_y = area
+    frame.render_widget(Paragraph::new(Text::from(visible)), editor_area);
+    if hint_area.height > 0 {
+        let hint_lines = wrapped_hint_lines(&composer_hint(app), hint_area.width as usize)
+            .into_iter()
+            .take(hint_area.height as usize)
+            .map(|line| Line::from(Span::styled(line, dim_style())))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Text::from(hint_lines)), hint_area);
+    }
+    let cursor_y = editor_area
         .y
         .saturating_add(cursor_row.saturating_sub(offset) as u16)
-        .min(area.bottom().saturating_sub(1));
-    let cursor_x = area
+        .min(editor_area.bottom().saturating_sub(1));
+    let cursor_x = editor_area
         .x
         .saturating_add(cursor_col as u16)
-        .min(area.right().saturating_sub(1));
+        .min(editor_area.right().saturating_sub(1));
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
@@ -587,12 +610,40 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
     (lines.len().min(u16::MAX as usize) as u16).clamp(1, maximum.max(1))
 }
 
+fn composer_panel_height(
+    prefix: &str,
+    text: &str,
+    hint: Option<&str>,
+    width: usize,
+    maximum: u16,
+) -> u16 {
+    let maximum = maximum.max(1);
+    let editor_height = composer_height(prefix, text, width, maximum);
+    let available_hint_height = maximum.saturating_sub(editor_height);
+    let hint_height = hint
+        .map(|hint| {
+            wrapped_hint_lines(hint, width)
+                .len()
+                .min(available_hint_height as usize) as u16
+        })
+        .unwrap_or_default();
+    editor_height.saturating_add(hint_height)
+}
+
+fn wrapped_hint_lines(hint: &str, width: usize) -> Vec<String> {
+    let (mut lines, _, _) = layout_with_cursor(hint, hint.len(), width.max(1));
+    if lines.len() > 1 && lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
 fn composer_hint(app: &App) -> String {
     let base = "$ skills · ←← menu · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X pause/remove · Ctrl+C close";
     if app.notice().is_empty() {
-        base.to_string()
+        format!("  {base}")
     } else {
-        format!("{} · {}", app.notice(), base)
+        format!("  {} · {}", app.notice(), base)
     }
 }
 
@@ -766,6 +817,16 @@ mod tests {
         assert_eq!(composer_height("＋ new › ", "1234567890", 10, 10), 2);
         assert_eq!(composer_height("＋ new › ", "\nsecond\nthird", 40, 2), 2);
         assert_eq!(composer_prefix(ComposeTarget::Reply, false), "↳ reply › ");
+    }
+
+    #[test]
+    fn empty_composer_reserves_wrapped_hint_rows_below_the_cursor() {
+        assert_eq!(
+            composer_panel_height("> ", "", Some("1234567890"), 5, 10),
+            3
+        );
+        assert_eq!(composer_panel_height("> ", "", Some("1234567890"), 5, 2), 2);
+        assert_eq!(composer_panel_height("> ", "typed", None, 5, 10), 2);
     }
 
     #[test]
