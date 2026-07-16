@@ -503,12 +503,159 @@ pub fn render_markdown(text: &str, base_style: Style, width: usize) -> Vec<Style
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
     let width = width.max(1);
+    let normalized = normalize_loose_pipe_tables(text);
     let mut builder = MarkdownBuilder::new(base_style, width);
-    for event in Parser::new_ext(text, options) {
+    for event in Parser::new_ext(&normalized, options) {
         builder.event(event);
     }
     let lines = wrap_lines(builder.finish(), width);
     highlight_field_labels(lines)
+}
+
+fn normalize_loose_pipe_tables(text: &str) -> String {
+    let source_lines = text.split('\n').collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut index = 0;
+    let mut fence_marker: Option<&'static str> = None;
+
+    while index < source_lines.len() {
+        let line = source_lines[index];
+        if let Some(marker) = fence_marker {
+            output.push(line.to_string());
+            if is_fence_line(line, marker) {
+                fence_marker = None;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(marker) = fence_start_marker(line) {
+            output.push(line.to_string());
+            fence_marker = Some(marker);
+            index += 1;
+            continue;
+        }
+
+        let Some(cells) = loose_pipe_cells(line) else {
+            output.push(line.to_string());
+            index += 1;
+            continue;
+        };
+        let column_count = cells.len();
+        let mut end = index + 1;
+        while end < source_lines.len() {
+            let next = source_lines[end];
+            if fence_start_marker(next).is_some() {
+                break;
+            }
+            if is_table_delimiter_row(next, column_count) {
+                end += 1;
+                continue;
+            }
+            let Some(next_cells) = loose_pipe_cells(next) else {
+                break;
+            };
+            if next_cells.len() != column_count {
+                break;
+            }
+            end += 1;
+        }
+
+        let block = &source_lines[index..end];
+        if block.len() < 2 {
+            output.push(line.to_string());
+            index += 1;
+            continue;
+        }
+
+        if output
+            .last()
+            .is_some_and(|previous| !previous.trim().is_empty())
+        {
+            output.push(String::new());
+        }
+        output.push(line.to_string());
+        if block
+            .get(1)
+            .is_none_or(|row| !is_table_delimiter_row(row, column_count))
+        {
+            output.push(loose_table_delimiter(line, column_count));
+        }
+        for row in &block[1..] {
+            output.push((*row).to_string());
+        }
+        if end < source_lines.len() && !source_lines[end].trim().is_empty() {
+            output.push(String::new());
+        }
+        index = end;
+    }
+
+    output.join("\n")
+}
+
+fn fence_start_marker(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        Some("```")
+    } else if trimmed.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
+}
+
+fn is_fence_line(line: &str, marker: &str) -> bool {
+    line.trim_start().starts_with(marker)
+}
+
+fn loose_pipe_cells(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || is_table_delimiter_candidate(trimmed) {
+        return None;
+    }
+    let body = trimmed.trim_matches('|');
+    let cells = body.split('|').map(str::trim).collect::<Vec<_>>();
+    if cells.len() < 2 || cells.iter().all(|cell| cell.is_empty()) {
+        return None;
+    }
+    Some(cells)
+}
+
+fn is_table_delimiter_row(line: &str, column_count: usize) -> bool {
+    let trimmed = line.trim();
+    if !is_table_delimiter_candidate(trimmed) {
+        return false;
+    }
+    let cells = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    cells.len() == column_count && cells.iter().all(|cell| is_alignment_cell(cell))
+}
+
+fn is_table_delimiter_candidate(line: &str) -> bool {
+    line.chars()
+        .all(|ch| matches!(ch, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn is_alignment_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    let without_left = trimmed.strip_prefix(':').unwrap_or(trimmed);
+    let without_right = without_left.strip_suffix(':').unwrap_or(without_left);
+    without_right.len() >= 3 && without_right.chars().all(|ch| ch == '-')
+}
+
+fn loose_table_delimiter(header: &str, column_count: usize) -> String {
+    let delimiter = (0..column_count)
+        .map(|_| "---")
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let trimmed = header.trim();
+    if trimmed.starts_with('|') || trimmed.ends_with('|') {
+        format!("| {delimiter} |")
+    } else {
+        delimiter
+    }
 }
 
 pub fn apply_osc8_links(frame: &mut Frame<'_>, area: Rect, lines: &[StyledLine]) {
@@ -928,6 +1075,55 @@ mod tests {
     }
 
     #[test]
+    fn markdown_renders_loose_pipe_tables_as_field_records() {
+        let lines = render_markdown(
+            "关键假设来自 Arizona P1 官方 20k/月，以及 P1+P2 合计约 50k/月。\n\
+             口径 | Taiwan | U.S. | Japan\n\
+             N3 | 约 80% | 约 10-15% | 约 5-8%\n\
+             N2 及更先进，新增 $100bn 后 | 约 53-60% | 约 40-47% | 0\n\
+             所以倒推：",
+            Style::default(),
+            42,
+        );
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.starts_with("关键假设")),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "口径: N3"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "U.S.: 约 10-15%"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "Japan: 0"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with("所以倒推")),
+            "rendered={rendered:?}"
+        );
+        assert_eq!(separators.len(), 3, "rendered={rendered:?}");
+        assert!(!rendered.iter().any(|line| line.contains("口径 │ Taiwan")));
+
+        let label = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text == "口径:")
+            .expect("field label");
+        assert_eq!(label.style.fg, Some(Color::Cyan));
+        assert!(label.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn markdown_keeps_narrow_tables_compact() {
         let lines = render_markdown(
             "| 公司 | 代码 |\n| --- | --- |\n| 英伟达 | NVDA |",
@@ -950,7 +1146,7 @@ mod tests {
     #[test]
     fn markdown_does_not_highlight_urls_or_code_block_fields() {
         let lines = render_markdown(
-            "https://example.com/path\n\n```text\n公司：英伟达\n```\n\n```markdown\n| 公司 | 代码 |\n| --- | --- |\n| 英伟达 | NVDA |\n```",
+            "https://example.com/path\n\n```text\n公司：英伟达\n口径 | Taiwan\nN3 | 约 80%\n```\n\n```markdown\n| 公司 | 代码 |\n| --- | --- |\n| 英伟达 | NVDA |\n```",
             Style::default(),
             80,
         );
@@ -965,7 +1161,9 @@ mod tests {
         assert!(!highlighted.iter().any(|text| *text == "公司："));
         let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
         assert!(rendered.iter().any(|line| line.contains("| 公司 | 代码 |")));
+        assert!(rendered.iter().any(|line| line.contains("口径 | Taiwan")));
         assert!(!rendered.iter().any(|line| line == "公司: 英伟达"));
+        assert!(!rendered.iter().any(|line| line == "口径: N3"));
     }
 
     #[test]
