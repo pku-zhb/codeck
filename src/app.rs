@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::{Map, Value, json};
 
 use crate::client::{ClientEvent, RpcSender};
+use crate::lifecycle::LifecycleStore;
 use crate::model::{ComposeTarget, Composer, MessageEntry, MessageKind, Session, SessionStatus};
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
@@ -63,7 +64,9 @@ pub struct AttachRequest {
 
 pub struct App {
     cwd: PathBuf,
-    include_all: bool,
+    show_all: bool,
+    lifecycle: LifecycleStore,
+    initial_scan_seen: BTreeSet<String>,
     sessions: Vec<Session>,
     selected: usize,
     composer: Composer,
@@ -83,10 +86,20 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cwd: PathBuf, include_all: bool) -> Self {
+    pub fn new(cwd: PathBuf, show_all: bool) -> Result<Self> {
+        Ok(Self::with_lifecycle(
+            cwd,
+            show_all,
+            LifecycleStore::load_default()?,
+        ))
+    }
+
+    fn with_lifecycle(cwd: PathBuf, show_all: bool, lifecycle: LifecycleStore) -> Self {
         Self {
             cwd,
-            include_all,
+            show_all,
+            lifecycle,
+            initial_scan_seen: BTreeSet::new(),
             sessions: Vec::new(),
             selected: 0,
             composer: Composer::default(),
@@ -180,6 +193,10 @@ impl App {
                     self.composer.cursor = 0;
                     return Ok(());
                 }
+                KeyCode::Char('d') => {
+                    self.dismiss_selected(sender)?;
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -201,12 +218,13 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert("\n")
             }
-            KeyCode::Enter if self.composer.text.is_empty() => self.request_attach(),
+            KeyCode::Enter if self.composer.text.is_empty() => self.request_attach()?,
             KeyCode::Enter => self.submit(sender)?,
             KeyCode::Backspace => self.composer.backspace(),
+            KeyCode::Delete if self.composer.text.is_empty() => self.dismiss_selected(sender)?,
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right if self.composer.text.is_empty() => self.request_attach(),
+            KeyCode::Right if self.composer.text.is_empty() => self.request_attach()?,
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Home => self.composer.cursor = 0,
             KeyCode::End => self.composer.cursor = self.composer.text.len(),
@@ -355,6 +373,10 @@ impl App {
                     return Ok(());
                 }
                 let first_load = !self.initial_load_complete;
+                if first_load {
+                    self.lifecycle.finish_initial_scan(&self.initial_scan_seen);
+                }
+                self.lifecycle.save().context("save session lifecycle")?;
                 self.list_inflight = false;
                 self.initial_load_complete = true;
                 self.ensure_selected_history(sender)?;
@@ -362,7 +384,7 @@ impl App {
                     self.notice = if self.sessions.is_empty() {
                         "Type a task and press Enter".to_string()
                     } else {
-                        format!("{} sessions", self.sessions.len())
+                        self.session_summary()
                     };
                 }
             }
@@ -378,6 +400,7 @@ impl App {
                 let session = Session::from_thread(thread)
                     .context("thread/start response has invalid thread")?;
                 let thread_id = session.id.clone();
+                self.track_session(&thread_id)?;
                 self.merge_session(session);
                 self.select_session(&thread_id);
                 self.composer.target = ComposeTarget::Reply;
@@ -437,8 +460,8 @@ impl App {
             "thread/started" => {
                 if let Some(thread) = params.get("thread")
                     && let Some(session) = Session::from_thread(thread)
-                    && self.should_include(&session)
                 {
+                    self.track_session(&session.id)?;
                     self.merge_session(session);
                 }
             }
@@ -446,10 +469,15 @@ impl App {
                 if let (Some(thread_id), Some(status)) = (
                     params.get("threadId").and_then(Value::as_str),
                     params.get("status"),
-                ) && let Some(session) = self.session_mut(thread_id)
-                {
-                    session.status = SessionStatus::from_protocol(status);
-                    self.sort_sessions_preserving_selection();
+                ) {
+                    let status = SessionStatus::from_protocol(status);
+                    if status.is_live() {
+                        self.track_session(thread_id)?;
+                    }
+                    if let Some(session) = self.session_mut(thread_id) {
+                        session.status = status;
+                        self.sort_sessions_preserving_selection();
+                    }
                 }
             }
             "thread/name/updated" => {
@@ -464,11 +492,13 @@ impl App {
             "thread/deleted" | "thread/archived" => {
                 if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
                     self.sessions.retain(|session| session.id != thread_id);
+                    self.lifecycle.dismiss(thread_id);
+                    self.lifecycle.save().context("save session lifecycle")?;
                     self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
                 }
             }
-            "turn/started" => self.handle_turn_started(&params),
-            "turn/completed" => self.handle_turn_completed(&params),
+            "turn/started" => self.handle_turn_started(&params)?,
+            "turn/completed" => self.handle_turn_completed(&params)?,
             "item/started" => self.handle_item(&params, false),
             "item/completed" => self.handle_item(&params, true),
             "item/agentMessage/delta" => self.handle_agent_delta(&params),
@@ -501,6 +531,7 @@ impl App {
             self.notice = format!("Unsupported app-server request: {method}");
             return Ok(());
         }
+        self.track_session(&thread_id)?;
 
         let kind = match method.as_str() {
             "item/tool/requestUserInput" => PendingRequestKind::UserInput(parse_questions(&params)),
@@ -548,11 +579,6 @@ impl App {
         cursor: Option<String>,
         paginate: bool,
     ) -> Result<()> {
-        let source_kinds = if self.include_all {
-            json!(["cli", "vscode", "exec", "appServer"])
-        } else {
-            json!(["appServer"])
-        };
         let id = sender.request(
             "thread/list",
             json!({
@@ -561,7 +587,7 @@ impl App {
                 "sortKey": "recency_at",
                 "sortDirection": "desc",
                 "archived": false,
-                "sourceKinds": source_kinds
+                "sourceKinds": ["cli", "vscode", "exec", "appServer"]
             }),
         )?;
         self.pending_calls
@@ -627,13 +653,13 @@ impl App {
             }
         };
 
-        let tail_kib = TAIL_PREVIEW_BYTES / 1024;
+        let tail_mib = TAIL_PREVIEW_BYTES / (1024 * 1024);
         let file_mib = preview.file_bytes as f64 / (1024.0 * 1024.0);
         let mut messages = vec![MessageEntry {
             id: "bounded-preview".to_string(),
             kind: MessageKind::System,
             text: format!(
-                "Large session ({file_mib:.1} MiB) · showing the latest {tail_kib} KiB · attach for full history"
+                "Large session ({file_mib:.1} MiB) · showing the latest {tail_mib} MiB · attach for full history"
             ),
         }];
         messages.extend(preview.messages);
@@ -685,6 +711,7 @@ impl App {
                     self.composer.insert(&text);
                     return Ok(());
                 };
+                self.track_session(&thread_id)?;
 
                 if self.has_pending_request(&thread_id) {
                     self.answer_pending_request(&thread_id, &text, sender)?;
@@ -862,10 +889,14 @@ impl App {
         let selected_id = self.selected_session().map(|session| session.id.clone());
         if let Some(threads) = result.get("data").and_then(Value::as_array) {
             for thread in threads {
-                if let Some(session) = Session::from_thread(thread)
-                    && self.should_include(&session)
-                {
-                    self.merge_session(session);
+                if let Some(session) = Session::from_thread(thread) {
+                    self.initial_scan_seen.insert(session.id.clone());
+                    if self.should_track(&session) {
+                        self.lifecycle.track(session.id.clone());
+                    }
+                    if self.should_include(&session) {
+                        self.merge_session(session);
+                    }
                 }
             }
         }
@@ -921,10 +952,11 @@ impl App {
         }
     }
 
-    fn handle_turn_started(&mut self, params: &Value) {
+    fn handle_turn_started(&mut self, params: &Value) -> Result<()> {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
-            return;
+            return Ok(());
         };
+        self.track_session(thread_id)?;
         let turn_id = params
             .get("turn")
             .and_then(|turn| turn.get("id"))
@@ -936,12 +968,14 @@ impl App {
             session.updated_at = unix_now();
         }
         self.sort_sessions_preserving_selection();
+        Ok(())
     }
 
-    fn handle_turn_completed(&mut self, params: &Value) {
+    fn handle_turn_completed(&mut self, params: &Value) -> Result<()> {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
-            return;
+            return Ok(());
         };
+        self.track_session(thread_id)?;
         let turn = params.get("turn").unwrap_or(&Value::Null);
         let turn_status = turn.get("status").and_then(Value::as_str);
         if let Some(session) = self.session_mut(thread_id) {
@@ -975,6 +1009,7 @@ impl App {
             _ => "Session completed".to_string(),
         };
         self.sort_sessions_preserving_selection();
+        Ok(())
     }
 
     fn handle_item(&mut self, params: &Value, completed: bool) {
@@ -1078,14 +1113,15 @@ impl App {
         self.ensure_selected_history(sender)
     }
 
-    fn request_attach(&mut self) {
+    fn request_attach(&mut self) -> Result<()> {
         let Some((thread_id, cwd)) = self
             .selected_session()
             .map(|session| (session.id.clone(), session.cwd.clone()))
         else {
             self.notice = "No session selected".to_string();
-            return;
+            return Ok(());
         };
+        self.track_session(&thread_id)?;
         self.attach_requested = Some(AttachRequest {
             thread_id,
             cwd: if cwd.is_empty() {
@@ -1095,6 +1131,7 @@ impl App {
             },
         });
         self.notice = "Attaching to native Codex…".to_string();
+        Ok(())
     }
 
     fn toggle_compose_target(&mut self) {
@@ -1105,8 +1142,58 @@ impl App {
         };
     }
 
+    fn should_track(&self, session: &Session) -> bool {
+        self.lifecycle.contains(&session.id)
+            || session.status.is_live()
+            || (!self.lifecycle.is_initialized()
+                && session.thread_source.as_deref() == Some(THREAD_SOURCE))
+    }
+
     fn should_include(&self, session: &Session) -> bool {
-        self.include_all || session.thread_source.as_deref() == Some(THREAD_SOURCE)
+        self.show_all || self.should_track(session)
+    }
+
+    fn track_session(&mut self, thread_id: &str) -> Result<()> {
+        if !self.lifecycle.is_initialized() {
+            self.initial_scan_seen.insert(thread_id.to_string());
+        }
+        self.lifecycle.track(thread_id.to_string());
+        self.lifecycle.save().context("save session lifecycle")
+    }
+
+    fn dismiss_selected(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        if self.show_all {
+            self.notice = "Dismiss is available in the lifecycle view, without --all".to_string();
+            return Ok(());
+        }
+        let Some(session) = self.selected_session() else {
+            self.notice = "No session selected".to_string();
+            return Ok(());
+        };
+        if session.status.is_live() {
+            self.notice = "Active sessions stay in the deck until they finish".to_string();
+            return Ok(());
+        }
+        let thread_id = session.id.clone();
+        self.lifecycle.dismiss(&thread_id);
+        self.lifecycle.save().context("save session lifecycle")?;
+        self.sessions.retain(|session| session.id != thread_id);
+        self.pending_requests
+            .retain(|request| request.thread_id != thread_id);
+        self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+        self.scroll_back = 0;
+        self.notice = "Reviewed session removed from the deck; Codex history was kept".to_string();
+        self.ensure_selected_history(sender)
+    }
+
+    fn session_summary(&self) -> String {
+        let active = self
+            .sessions
+            .iter()
+            .filter(|session| session.status.is_live())
+            .count();
+        let completed = self.sessions.len().saturating_sub(active);
+        format!("{active} active · {completed} completed")
     }
 
     fn session(&self, thread_id: &str) -> Option<&Session> {
@@ -1454,6 +1541,46 @@ fn unix_now() -> i64 {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_STATE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestSender {
+        next_id: u64,
+    }
+
+    impl RpcSender for TestSender {
+        fn request(&mut self, _method: &str, _params: Value) -> Result<u64> {
+            self.next_id += 1;
+            Ok(self.next_id)
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn respond(&mut self, _id: Value, _result: Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn respond_error(&mut self, _id: Value, _code: i64, _message: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_app(show_all: bool) -> (App, PathBuf) {
+        let sequence = NEXT_TEST_STATE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "codex-deck-app-lifecycle-{}-{sequence}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let lifecycle = LifecycleStore::for_test(path.clone());
+        (
+            App::with_lifecycle(PathBuf::from("/tmp"), show_all, lifecycle),
+            path,
+        )
+    }
 
     #[test]
     fn reads_thinking_and_final_in_one_ordered_stream() {
@@ -1498,7 +1625,7 @@ mod tests {
 
     #[test]
     fn attach_targets_the_selected_session_and_its_directory() {
-        let mut app = App::new(PathBuf::from("/tmp"), true);
+        let (mut app, state_path) = test_app(true);
         app.sessions.push(Session {
             id: "thread-123".to_string(),
             title: "Test".to_string(),
@@ -1514,9 +1641,66 @@ mod tests {
             history_loaded: true,
         });
 
-        app.request_attach();
+        app.request_attach().expect("request attach");
         let request = app.take_attach_request().expect("attach request");
         assert_eq!(request.thread_id, "thread-123");
         assert_eq!(request.cwd, PathBuf::from("/tmp/project"));
+        std::fs::remove_file(state_path).expect("remove lifecycle state");
+    }
+
+    #[test]
+    fn lifecycle_view_adopts_live_sessions_but_skips_old_history() {
+        let (mut app, state_path) = test_app(false);
+        app.merge_thread_list(&json!({
+            "data": [
+                {
+                    "id": "old-thread",
+                    "preview": "Old history",
+                    "cwd": "/tmp/old",
+                    "status": {"type": "idle"},
+                    "source": "cli",
+                    "threadSource": "cli"
+                },
+                {
+                    "id": "live-thread",
+                    "preview": "Current work",
+                    "cwd": "/tmp/live",
+                    "status": {"type": "active", "activeFlags": []},
+                    "source": "appServer",
+                    "threadSource": "cli"
+                }
+            ]
+        }));
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, "live-thread");
+        assert!(app.lifecycle.contains("live-thread"));
+        assert!(!app.lifecycle.contains("old-thread"));
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn completed_session_waits_for_review_then_leaves_only_the_deck() {
+        let (mut app, state_path) = test_app(false);
+        let session = Session::from_thread(&json!({
+            "id": "review-thread",
+            "preview": "Review me",
+            "cwd": "/tmp/review",
+            "status": {"type": "active", "activeFlags": []},
+            "source": "appServer",
+            "threadSource": "codex-deck"
+        }))
+        .expect("session");
+        app.lifecycle.track(session.id.clone());
+        app.sessions.push(session);
+        app.sessions[0].status = SessionStatus::Completed;
+        let mut sender = TestSender { next_id: 0 };
+
+        app.dismiss_selected(&mut sender).expect("dismiss session");
+
+        assert!(app.sessions.is_empty());
+        assert!(!app.lifecycle.contains("review-thread"));
+        assert!(app.notice.contains("Codex history was kept"));
+        std::fs::remove_file(state_path).expect("remove lifecycle state");
     }
 }

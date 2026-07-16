@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::model::{MessageEntry, MessageKind};
 
 pub const FULL_HISTORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
-pub const TAIL_PREVIEW_BYTES: u64 = 512 * 1024;
+pub const TAIL_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 const MAX_TEXT_CHARS: usize = 12_000;
 const MAX_MESSAGES: usize = 24;

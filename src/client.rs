@@ -275,7 +275,7 @@ fn ensure_app_server() -> Result<PathBuf> {
     )
 }
 
-fn state_dir() -> Result<PathBuf> {
+pub(crate) fn state_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".codex-deck"))
 }

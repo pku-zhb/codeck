@@ -44,6 +44,10 @@ impl SessionStatus {
             Self::Completed => 3,
         }
     }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::NeedsInput | Self::Working)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -247,7 +247,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn composer_hint(app: &App) -> String {
-    let base = "Enter/→ attach · Tab new/reply · ↑↓ select · PgUp/PgDn scroll · Ctrl+C close";
+    let base = "Enter/→ attach · Tab new/reply · ↑↓ select · Del reviewed · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {

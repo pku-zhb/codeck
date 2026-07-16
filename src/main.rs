@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod lifecycle;
 mod model;
 mod transcript;
 mod ui;
@@ -30,9 +31,9 @@ struct Args {
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Show only sessions created by codex-deck.
+    /// Browse all unarchived Codex history instead of the managed lifecycle.
     #[arg(long)]
-    managed_only: bool,
+    all: bool,
 
     /// Verify daemon connectivity and print a short summary.
     #[arg(long)]
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let cwd = resolve_cwd(args.cwd)?;
     let mut client = CodexClient::connect()?;
-    let mut app = App::new(cwd, !args.managed_only);
+    let mut app = App::new(cwd, args.all)?;
     app.begin(&mut client)?;
 
     if args.check {
