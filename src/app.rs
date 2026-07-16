@@ -128,8 +128,8 @@ pub struct HistoryPickerView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuTab {
+    Resume,
     Settings,
-    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +184,7 @@ pub struct App {
     menu_tab: MenuTab,
     settings_selection: PreviewVerbosity,
     settings_left_armed: bool,
+    force_full_redraw: bool,
     ctrl_x_armed: Option<CtrlXConfirmation>,
     rename_previous: Option<Composer>,
     rename_thread_id: Option<String>,
@@ -230,9 +231,10 @@ impl App {
             attach_requested: None,
             attach_right_armed: false,
             settings_open: false,
-            menu_tab: MenuTab::Settings,
+            menu_tab: MenuTab::Resume,
             settings_selection,
             settings_left_armed: false,
+            force_full_redraw: false,
             ctrl_x_armed: None,
             rename_previous: None,
             rename_thread_id: None,
@@ -430,7 +432,7 @@ impl App {
 
     pub fn insert_paste(&mut self, text: &str) {
         if self.settings_open {
-            if self.menu_tab == MenuTab::All
+            if self.menu_tab == MenuTab::Resume
                 && let Some(picker) = &mut self.history_picker
             {
                 picker.query.push_str(text);
@@ -579,6 +581,10 @@ impl App {
         self.menu_tab
     }
 
+    pub fn take_force_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.force_full_redraw)
+    }
+
     pub fn skill_picker_view(&self) -> Option<SkillPickerView> {
         let picker = self.skill_picker.as_ref()?;
         let items = self
@@ -597,7 +603,7 @@ impl App {
     }
 
     pub fn history_picker_view(&self) -> Option<HistoryPickerView> {
-        if !self.settings_open || self.menu_tab != MenuTab::All {
+        if !self.settings_open || self.menu_tab != MenuTab::Resume {
             return None;
         }
         let picker = self.history_picker.as_ref()?;
@@ -1598,12 +1604,13 @@ impl App {
             self.settings_left_armed = false;
             self.attach_right_armed = false;
             self.settings_selection = self.lifecycle.preview_verbosity();
-            self.menu_tab = MenuTab::Settings;
+            self.menu_tab = MenuTab::Resume;
             self.history_picker = Some(HistoryPicker {
                 query: String::new(),
                 selected: 0,
             });
             self.settings_open = true;
+            self.force_full_redraw = true;
             self.notice.clear();
         } else {
             self.settings_left_armed = true;
@@ -1780,10 +1787,11 @@ impl App {
 
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.menu_tab = match self.menu_tab {
-                MenuTab::Settings => MenuTab::All,
-                MenuTab::All => MenuTab::Settings,
+                MenuTab::Resume => MenuTab::Settings,
+                MenuTab::Settings => MenuTab::Resume,
             };
             self.settings_left_armed = false;
+            self.force_full_redraw = true;
             return Ok(());
         }
 
@@ -1795,6 +1803,7 @@ impl App {
             self.settings_left_armed = false;
             self.history_picker = None;
             self.settings_selection = self.lifecycle.preview_verbosity();
+            self.force_full_redraw = true;
             self.notice = "Menu closed".to_string();
             return Ok(());
         }
@@ -1803,24 +1812,28 @@ impl App {
             return Ok(());
         }
 
-        if self.menu_tab == MenuTab::All {
-            return self.handle_all_tab_key(key, sender);
+        if self.menu_tab == MenuTab::Resume {
+            return self.handle_resume_tab_key(key, sender);
         }
 
         match key.code {
             KeyCode::Up => {
+                let previous = self.settings_selection;
                 self.settings_selection = match self.settings_selection {
                     PreviewVerbosity::Full => PreviewVerbosity::Full,
                     PreviewVerbosity::Progress => PreviewVerbosity::Full,
                     PreviewVerbosity::Final => PreviewVerbosity::Progress,
                 };
+                self.force_full_redraw |= self.settings_selection != previous;
             }
             KeyCode::Down => {
+                let previous = self.settings_selection;
                 self.settings_selection = match self.settings_selection {
                     PreviewVerbosity::Full => PreviewVerbosity::Progress,
                     PreviewVerbosity::Progress => PreviewVerbosity::Final,
                     PreviewVerbosity::Final => PreviewVerbosity::Final,
                 };
+                self.force_full_redraw |= self.settings_selection != previous;
             }
             KeyCode::Enter => {
                 self.lifecycle
@@ -1829,6 +1842,7 @@ impl App {
                 self.settings_open = false;
                 self.settings_left_armed = false;
                 self.history_picker = None;
+                self.force_full_redraw = true;
                 self.scroll_back = 0;
                 self.notice = format!(
                     "Preview verbosity: {}",
@@ -1840,7 +1854,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_all_tab_key(&mut self, key: KeyEvent, sender: &mut impl RpcSender) -> Result<()> {
+    fn handle_resume_tab_key(&mut self, key: KeyEvent, sender: &mut impl RpcSender) -> Result<()> {
         match key.code {
             KeyCode::Up => {
                 if let Some(picker) = &mut self.history_picker {
@@ -1909,6 +1923,7 @@ impl App {
         self.settings_open = false;
         self.settings_left_armed = false;
         self.history_picker = None;
+        self.force_full_redraw = true;
         self.scroll_back = 0;
         self.ensure_selected_history(sender)?;
         self.notice = format!("Added {title} · type a reply and press Enter to resume");
@@ -2899,13 +2914,20 @@ mod tests {
         )
         .expect("second left");
         assert!(app.settings_open());
+        assert_eq!(app.menu_tab(), MenuTab::Resume);
+        assert!(app.take_force_full_redraw());
         assert_eq!(app.settings_selection(), PreviewVerbosity::Full);
 
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
+            .expect("switch to settings");
+        assert_eq!(app.menu_tab(), MenuTab::Settings);
+        assert!(app.take_force_full_redraw());
         app.handle_key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &mut sender,
         )
         .expect("select progress");
+        assert!(app.take_force_full_redraw());
         app.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut sender,
@@ -2920,7 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn all_menu_adds_a_history_session_then_resumes_it_in_the_deck() {
+    fn resume_menu_adds_a_history_session_then_resumes_it_in_the_deck() {
         let (mut app, state_path) = test_app(false);
         app.merge_history_session(test_session(
             "history-thread",
@@ -2939,11 +2961,11 @@ mod tests {
             &mut sender,
         )
         .expect("open menu");
-        assert_eq!(app.menu_tab(), MenuTab::Settings);
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
-            .expect("switch to all");
-        assert_eq!(app.menu_tab(), MenuTab::All);
-        assert_eq!(app.history_picker_view().expect("all tab").items.len(), 1);
+        assert_eq!(app.menu_tab(), MenuTab::Resume);
+        assert_eq!(
+            app.history_picker_view().expect("resume tab").items.len(),
+            1
+        );
         for character in "research".chars() {
             app.handle_key(
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),

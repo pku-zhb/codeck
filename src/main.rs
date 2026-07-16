@@ -140,6 +140,9 @@ fn run_event_loop(
         }
 
         if needs_draw {
+            if app.take_force_full_redraw() {
+                force_full_redraw(terminal).context("force full TUI redraw")?;
+            }
             terminal.draw(|frame| ui::render(frame, app))?;
             needs_draw = false;
         }

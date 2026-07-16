@@ -34,7 +34,7 @@ automatically adopts sessions started by the deck and currently active sessions
 from other Codex clients. Completed sessions remain until you review and dismiss
 them. The list is grouped as `Pinned`, `Working`, and `Completed`; pinned sessions
 stay in the first group regardless of their current runtime status. Historical
-sessions outside the Deck are available from the built-in `All` menu tab, so
+sessions outside the Deck are available from the built-in `Resume` menu tab, so
 resuming old work does not require leaving the dashboard or adding CLI flags.
 
 Check daemon connectivity without opening the TUI:
@@ -46,13 +46,13 @@ codex-deck --check
 ## Keys
 
 - `Up` / `Down`: select a session
-- `Left`, twice consecutively: open the menu when the composer is empty;
-  use `Tab` to switch between `Settings` and `All`
-- In `Settings`: choose preview verbosity with `Up` / `Down` and save with
-  `Enter`
-- In `All`: type to filter historical sessions, choose with `Up` / `Down`, and
+- `Left`, twice consecutively: open the menu on its default `Resume` tab when
+  the composer is empty; use `Tab` to switch to `Settings`
+- In `Resume`: type to filter historical sessions, choose with `Up` / `Down`, and
   press `Enter` to add one to the Deck; the composer switches to Reply so the
   next message resumes it in the background
+- In `Settings`: choose preview verbosity with `Up` / `Down` and save with
+  `Enter`
 - `Right`, twice consecutively: attach the selected session in the native Codex
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
@@ -115,7 +115,7 @@ When Codex asks several questions, separate answers with `|`.
 The lifecycle registry is stored in `~/.codex-deck/lifecycle.json`. It contains
 tracked and pinned thread IDs. Removing a session updates this registry without
 deleting, archiving, or modifying the underlying Codex thread. A removed thread
-is available immediately in the `All` tab and is automatically adopted again if
+is available immediately in the `Resume` tab and is automatically adopted again if
 it becomes active elsewhere later.
 
 The dashboard does not inspect terminal processes or SQLite. A bounded rollout

@@ -142,8 +142,8 @@ fn render_menu(
     };
     let mut lines = vec![menu_tabs(tab), Line::default()];
     match tab {
+        MenuTab::Resume => render_resume_tab(frame, panel, history, &mut lines),
         MenuTab::Settings => render_settings_tab(frame, panel, selected, &mut lines),
-        MenuTab::All => render_all_tab(frame, panel, history, &mut lines),
     }
 }
 
@@ -158,8 +158,8 @@ fn menu_tabs(selected: MenuTab) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "Settings",
-            if selected == MenuTab::Settings {
+            "Resume",
+            if selected == MenuTab::Resume {
                 active
             } else {
                 inactive
@@ -167,8 +167,8 @@ fn menu_tabs(selected: MenuTab) -> Line<'static> {
         ),
         Span::styled("  ", inactive),
         Span::styled(
-            "All",
-            if selected == MenuTab::All {
+            "Settings",
+            if selected == MenuTab::Settings {
                 active
             } else {
                 inactive
@@ -243,7 +243,7 @@ fn render_settings_tab(
     }
 }
 
-fn render_all_tab(
+fn render_resume_tab(
     frame: &mut Frame<'_>,
     panel: Rect,
     history: Option<&HistoryPickerView>,
