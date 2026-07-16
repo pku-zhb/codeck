@@ -64,6 +64,12 @@ Sessions with large rollout files use a bounded 4 MiB tail preview instead of
 requesting the full transcript, so one oversized history cannot disconnect the
 dashboard.
 
+Conversation content is rendered as terminal-native Markdown: headings,
+emphasis, lists, quotes, inline/fenced code, task lists, tables, and links get
+distinct ANSI styles. Absolute local paths plus `http`, `https`, `file`, and
+`mailto` Markdown targets are emitted as OSC 8 hyperlinks without exposing the
+target in the visible text.
+
 When Codex requests approval, reply with `y` (once), `a` (session), or `n`.
 When Codex asks several questions, separate answers with `|`.
 

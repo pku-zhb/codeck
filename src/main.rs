@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod lifecycle;
+mod markdown;
 mod model;
 mod transcript;
 mod ui;

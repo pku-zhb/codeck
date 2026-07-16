@@ -2,11 +2,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
+use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
 use crate::model::{ComposeTarget, MessageEntry, MessageKind, SessionStatus};
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -16,20 +17,41 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let input_height = area.height.min(2);
-    let available = area.height.saturating_sub(input_height);
+    let separator_height = u16::from(area.height >= 6);
+    let available = area
+        .height
+        .saturating_sub(input_height)
+        .saturating_sub(separator_height.saturating_mul(2));
     let max_sessions = (available / 3).max(1);
     let desired_sessions = app.sessions().len().max(1) as u16;
     let session_height = desired_sessions.min(max_sessions).min(available);
     let chunks = Layout::vertical([
         Constraint::Length(session_height),
+        Constraint::Length(separator_height),
         Constraint::Min(0),
+        Constraint::Length(separator_height),
         Constraint::Length(input_height),
     ])
     .split(area);
 
     render_sessions(frame, chunks[0], app);
-    render_messages(frame, chunks[1], app);
-    render_composer(frame, chunks[2], app);
+    render_separator(frame, chunks[1]);
+    render_messages(frame, chunks[2], app);
+    render_separator(frame, chunks[3]);
+    render_composer(frame, chunks[4], app);
+}
+
+fn render_separator(frame: &mut Frame<'_>, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+        area,
+    );
 }
 
 fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -67,7 +89,7 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn session_line(session: &crate::model::Session, selected: bool, width: usize) -> Line<'static> {
     let row_style = if selected {
-        Style::default().bg(Color::Rgb(38, 48, 45))
+        Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
     };
@@ -99,7 +121,14 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
         Span::styled("● ", dot_style.patch(row_style)),
         Span::styled(title, title_style),
         Span::styled(spacer, row_style),
-        Span::styled(right, row_style.fg(Color::DarkGray)),
+        Span::styled(
+            right,
+            if selected {
+                row_style
+            } else {
+                row_style.fg(Color::DarkGray)
+            },
+        ),
     ])
     .style(row_style)
 }
@@ -109,25 +138,25 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     app.set_message_view_height(area.height as usize);
-    let mut lines = match app.selected_session() {
+    let mut lines: Vec<StyledLine> = match app.selected_session() {
         Some(session) if !session.history_loaded && session.messages.is_empty() => {
-            vec![Line::from(Span::styled(
+            vec![StyledLine::from_span(
                 "  Loading conversation…",
                 dim_style(),
-            ))]
+            )]
         }
-        Some(session) if session.messages.is_empty() => vec![Line::from(Span::styled(
+        Some(session) if session.messages.is_empty() => vec![StyledLine::from_span(
             "  No conversation content yet",
             dim_style(),
-        ))],
+        )],
         Some(session) => message_lines(&session.messages, area.width as usize),
-        None => vec![Line::from(Span::styled(
+        None => vec![StyledLine::from_span(
             "  New tasks will appear here and keep running after you close the deck.",
             dim_style(),
-        ))],
+        )],
     };
     if lines.is_empty() {
-        lines.push(Line::default());
+        lines.push(StyledLine::default());
     }
 
     let viewport = area.height as usize;
@@ -135,33 +164,42 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let scroll_back = app.scroll_back().min(max_start);
     app.set_scroll_back(scroll_back);
     let start = max_start.saturating_sub(scroll_back);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .scroll((start.min(u16::MAX as usize) as u16, 0))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let end = (start + viewport).min(lines.len());
+    let visible = &lines[start..end];
+    let rendered = visible
+        .iter()
+        .map(StyledLine::to_ratatui)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(rendered)), area);
+    apply_osc8_links(frame, area, visible);
 }
 
-fn message_lines(messages: &[MessageEntry], width: usize) -> Vec<Line<'static>> {
+fn message_lines(messages: &[MessageEntry], width: usize) -> Vec<StyledLine> {
     let mut lines = Vec::new();
     for message in messages {
         let (prefix, prefix_style, text_style) = message_style(message.kind);
-        let wrapped = wrap_message(&message.text, prefix, width.max(1));
-        for (index, line) in wrapped.into_iter().enumerate() {
-            if index == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled(prefix.to_string(), prefix_style),
-                    Span::styled(line, text_style),
-                ]));
+        let gutter_width = UnicodeWidthStr::width(prefix).max(1);
+        let content_width = width.saturating_sub(gutter_width).max(1);
+        let markdown = render_markdown(&message.text, text_style, content_width);
+        for (index, line) in markdown.into_iter().enumerate() {
+            let gutter = if index == 0 {
+                prefix.to_string()
             } else {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(line, text_style),
-                ]));
-            }
+                format!("│{}", " ".repeat(gutter_width.saturating_sub(1)))
+            };
+            let mut spans = vec![StyledSpan {
+                text: gutter,
+                style: if index == 0 {
+                    prefix_style
+                } else {
+                    prefix_style.remove_modifier(Modifier::BOLD)
+                },
+                link: None,
+            }];
+            spans.extend(line.spans);
+            lines.push(StyledLine { spans });
         }
-        lines.push(Line::default());
+        lines.push(StyledLine::default());
     }
     lines
 }
@@ -255,48 +293,6 @@ fn composer_hint(app: &App) -> String {
     }
 }
 
-fn wrap_message(text: &str, prefix: &str, width: usize) -> Vec<String> {
-    let first_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
-    let next_width = width.saturating_sub(2).max(1);
-    let mut output = Vec::new();
-    let mut first = true;
-    for logical_line in text.split('\n') {
-        let budget = if first { first_width } else { next_width };
-        let mut wrapped = wrap_graphemes(logical_line, budget);
-        if wrapped.is_empty() {
-            wrapped.push(String::new());
-        }
-        output.append(&mut wrapped);
-        first = false;
-    }
-    if output.is_empty() {
-        output.push(String::new());
-    }
-    output
-}
-
-fn wrap_graphemes(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
-        if current_width > 0 && current_width + grapheme_width > width {
-            lines.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push_str(grapheme);
-        current_width += grapheme_width;
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
 fn layout_with_cursor(text: &str, cursor_byte: usize, width: usize) -> (Vec<String>, usize, usize) {
     let width = width.max(1);
     let mut lines = vec![String::new()];
@@ -366,6 +362,7 @@ fn dim_style() -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Session;
 
     #[test]
     fn truncation_respects_cjk_width() {
@@ -378,5 +375,51 @@ mod tests {
         assert_eq!(lines[0], "1234");
         assert_eq!(lines[1], "56");
         assert_eq!((row, column), (1, 2));
+    }
+
+    #[test]
+    fn selected_session_uses_terminal_theme_reverse_video() {
+        let session = Session {
+            id: "thread".to_string(),
+            title: "Readable selection".to_string(),
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            path: None,
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some("codex-deck".to_string()),
+            status: SessionStatus::Working,
+            active_turn_id: None,
+            messages: Vec::new(),
+            history_loaded: true,
+        };
+
+        let line = session_line(&session, true, 40);
+        assert!(line.style.add_modifier.contains(Modifier::REVERSED));
+        assert!(line.style.bg.is_none());
+    }
+
+    #[test]
+    fn message_stream_keeps_role_gutter_and_markdown_styles() {
+        let lines = message_lines(
+            &[MessageEntry {
+                id: "final".to_string(),
+                kind: MessageKind::Final,
+                text: "**Done**\n\n- [link](https://example.com)".to_string(),
+            }],
+            60,
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+
+        assert!(spans.iter().any(|span| span.text == "✅ "));
+        assert!(spans.iter().any(|span| {
+            span.text.contains("Done") && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.text.contains("link") && span.link.as_deref() == Some("https://example.com")
+        }));
     }
 }
