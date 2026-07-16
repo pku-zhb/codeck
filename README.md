@@ -54,6 +54,8 @@ codex-deck --check
 - `Right`, twice consecutively: attach the selected session in the native Codex
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
+- `$`: open the Codex skill picker; keep typing to filter, choose with `Up` /
+  `Down`, and insert with `Enter` or `Tab`
 - `Ctrl+N`: compose a new task
 - `Ctrl+V` (or `Cmd+V` when the terminal forwards it): attach an image from the
   system clipboard; pasting one or more image file paths also attaches them
@@ -75,6 +77,11 @@ Drafts are isolated by intent: `New` has one global draft, while `Reply` keeps a
 separate in-memory draft for every session. Moving with `Up` / `Down` saves and
 restores the corresponding reply text, cursor, and image attachments, so a
 half-written reply cannot be sent to the newly selected session.
+
+The skill picker uses Codex app-server's `skills/list` result for the active
+working directory. Selected skills are sent as native structured `skill` input
+items in addition to their visible `$skill-name` prompt marker. Local skill
+changes invalidate the cached picker automatically.
 
 While attached, use native Codex normally. Run `/exit` to return to the deck;
 the dashboard reconnects to the same app-server and refreshes the transcript.

@@ -202,6 +202,13 @@ pub struct Composer {
     pub cursor: usize,
     pub target: ComposeTarget,
     pub images: Vec<PathBuf>,
+    pub skills: Vec<SkillReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReference {
+    pub name: String,
+    pub path: String,
 }
 
 impl Default for Composer {
@@ -211,6 +218,7 @@ impl Default for Composer {
             cursor: 0,
             target: ComposeTarget::NewTask,
             images: Vec::new(),
+            skills: Vec::new(),
         }
     }
 }
@@ -219,6 +227,7 @@ impl Composer {
     pub fn insert(&mut self, text: &str) {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.prune_skills();
     }
 
     pub fn backspace(&mut self) {
@@ -232,6 +241,7 @@ impl Composer {
             .unwrap_or(0);
         self.text.drain(previous..self.cursor);
         self.cursor = previous;
+        self.prune_skills();
     }
 
     pub fn delete(&mut self) {
@@ -244,6 +254,7 @@ impl Composer {
             .map(|(index, _)| self.cursor + index)
             .unwrap_or(self.text.len());
         self.text.drain(self.cursor..next);
+        self.prune_skills();
     }
 
     pub fn move_left(&mut self) {
@@ -273,6 +284,32 @@ impl Composer {
     pub fn take_images(&mut self) -> Vec<PathBuf> {
         std::mem::take(&mut self.images)
     }
+
+    pub fn take_skills(&mut self) -> Vec<SkillReference> {
+        std::mem::take(&mut self.skills)
+    }
+
+    pub fn replace_with_skill(&mut self, start: usize, skill: SkillReference) {
+        if start > self.cursor || self.cursor > self.text.len() {
+            return;
+        }
+        let replacement = format!("${} ", skill.name);
+        self.text.replace_range(start..self.cursor, &replacement);
+        self.cursor = start + replacement.len();
+        self.skills.retain(|existing| existing.path != skill.path);
+        self.skills.push(skill);
+        self.prune_skills();
+    }
+
+    fn prune_skills(&mut self) {
+        self.skills
+            .retain(|skill| has_skill_token(&self.text, &skill.name));
+    }
+}
+
+fn has_skill_token(text: &str, name: &str) -> bool {
+    let token = format!("${name}");
+    text.split_whitespace().any(|part| part == token)
 }
 
 fn source_label(value: Option<&Value>) -> String {
@@ -323,5 +360,25 @@ mod tests {
         composer.move_left();
         composer.delete();
         assert_eq!(composer.text, "你");
+    }
+
+    #[test]
+    fn composer_keeps_only_intact_selected_skill_tokens() {
+        let mut composer = Composer::default();
+        composer.insert("$doc");
+        composer.replace_with_skill(
+            0,
+            SkillReference {
+                name: "documents".to_string(),
+                path: "/tmp/documents/SKILL.md".to_string(),
+            },
+        );
+        assert_eq!(composer.text, "$documents ");
+        assert_eq!(composer.skills.len(), 1);
+
+        composer.backspace();
+        assert_eq!(composer.skills.len(), 1);
+        composer.backspace();
+        assert!(composer.skills.is_empty());
     }
 }

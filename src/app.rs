@@ -11,6 +11,7 @@ use crate::clipboard::{image_paths_from_paste, save_clipboard_image};
 use crate::lifecycle::LifecycleStore;
 use crate::model::{
     ComposeTarget, Composer, MessageEntry, MessageKind, PreviewVerbosity, Session, SessionStatus,
+    SkillReference,
 };
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
@@ -45,6 +46,9 @@ enum PendingCall {
     ThreadNameSet {
         thread_id: String,
         name: String,
+    },
+    SkillsList {
+        cwd: String,
     },
 }
 
@@ -89,6 +93,30 @@ pub struct AttachRequest {
 struct PromptDraft {
     text: String,
     images: Vec<PathBuf>,
+    skills: Vec<SkillReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillPicker {
+    cwd: String,
+    query_start: usize,
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillPickerView {
+    pub items: Vec<SkillMetadata>,
+    pub selected: usize,
+    pub loading: bool,
 }
 
 pub struct App {
@@ -101,6 +129,9 @@ pub struct App {
     composer: Composer,
     new_draft: Composer,
     reply_drafts: HashMap<String, Composer>,
+    skills_by_cwd: HashMap<String, Vec<SkillMetadata>>,
+    skills_inflight: BTreeSet<String>,
+    skill_picker: Option<SkillPicker>,
     pending_calls: HashMap<u64, PendingCall>,
     pending_requests: Vec<PendingRequest>,
     queued_replies: HashMap<String, String>,
@@ -143,6 +174,9 @@ impl App {
             composer: Composer::default(),
             new_draft: Composer::default(),
             reply_drafts: HashMap::new(),
+            skills_by_cwd: HashMap::new(),
+            skills_inflight: BTreeSet::new(),
+            skill_picker: None,
             pending_calls: HashMap::new(),
             pending_requests: Vec::new(),
             queued_replies: HashMap::new(),
@@ -225,6 +259,10 @@ impl App {
             return self.handle_settings_key(key);
         }
 
+        if self.handle_skill_picker_key(key) {
+            return Ok(());
+        }
+
         let attach_right = key.code == KeyCode::Right
             && self.composer.text.is_empty()
             && self.composer.target != ComposeTarget::Rename
@@ -245,6 +283,7 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
+            self.skill_picker = None;
             self.paste_clipboard_image();
             return Ok(());
         }
@@ -252,12 +291,14 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('n') => {
+                    self.skill_picker = None;
                     self.cancel_rename();
                     self.switch_to_new_draft();
                     self.notice = "New task".to_string();
                     return Ok(());
                 }
                 KeyCode::Char('r') => {
+                    self.skill_picker = None;
                     self.start_rename();
                     return Ok(());
                 }
@@ -265,17 +306,22 @@ impl App {
                     self.composer.text.clear();
                     self.composer.cursor = 0;
                     self.composer.images.clear();
+                    self.composer.skills.clear();
+                    self.skill_picker = None;
                     return Ok(());
                 }
                 KeyCode::Char('v') => {
+                    self.skill_picker = None;
                     self.paste_clipboard_image();
                     return Ok(());
                 }
                 KeyCode::Char('t') => {
+                    self.skill_picker = None;
                     self.toggle_pin_selected()?;
                     return Ok(());
                 }
                 KeyCode::Char('x') => {
+                    self.skill_picker = None;
                     self.stop_or_remove_selected(sender)?;
                     return Ok(());
                 }
@@ -329,11 +375,13 @@ impl App {
             }
             _ => {}
         }
+        self.sync_skill_picker(sender)?;
         Ok(())
     }
 
     pub fn insert_text(&mut self, text: &str) {
         self.attach_right_armed = false;
+        self.skill_picker = None;
         self.composer.insert(text);
     }
 
@@ -341,6 +389,7 @@ impl App {
         if self.settings_open {
             return;
         }
+        self.skill_picker = None;
         if text.is_empty() {
             self.paste_clipboard_image();
             return;
@@ -388,6 +437,7 @@ impl App {
         self.composer.text = draft.text;
         self.composer.cursor = self.composer.text.len();
         self.composer.images = draft.images;
+        self.composer.skills = draft.skills;
     }
 
     pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
@@ -481,6 +531,23 @@ impl App {
         self.settings_selection
     }
 
+    pub fn skill_picker_view(&self) -> Option<SkillPickerView> {
+        let picker = self.skill_picker.as_ref()?;
+        let items = self
+            .skills_by_cwd
+            .get(&picker.cwd)
+            .into_iter()
+            .flatten()
+            .filter(|skill| skill_matches(skill, &picker.query))
+            .cloned()
+            .collect::<Vec<_>>();
+        Some(SkillPickerView {
+            selected: picker.selected.min(items.len().saturating_sub(1)),
+            loading: self.skills_inflight.contains(&picker.cwd),
+            items,
+        })
+    }
+
     fn handle_protocol_message(
         &mut self,
         message: Value,
@@ -510,6 +577,9 @@ impl App {
             if matches!(call, PendingCall::ThreadList { .. }) {
                 self.list_inflight = false;
             }
+            if let PendingCall::SkillsList { cwd } = &call {
+                self.skills_inflight.remove(cwd);
+            }
             if matches!(&call, PendingCall::ThreadNameSet { .. }) {
                 self.cancel_rename();
             }
@@ -528,6 +598,8 @@ impl App {
                 self.initialized = true;
                 self.notice = "Connected".to_string();
                 self.request_thread_list(sender)?;
+                let cwd = self.cwd.to_string_lossy().into_owned();
+                self.request_skills(&cwd, false, sender)?;
             }
             PendingCall::ThreadList { paginate } => {
                 self.merge_thread_list(&result);
@@ -639,6 +711,12 @@ impl App {
                 self.notice = format!("Renamed session to {name}");
                 self.sort_sessions_preserving_selection();
             }
+            PendingCall::SkillsList { cwd } => {
+                self.skills_inflight.remove(&cwd);
+                self.skills_by_cwd
+                    .insert(cwd, skills_from_list_response(&result));
+                self.clamp_skill_picker_selection();
+            }
         }
         Ok(())
     }
@@ -647,7 +725,7 @@ impl App {
         &mut self,
         method: &str,
         params: Value,
-        _sender: &mut impl RpcSender,
+        sender: &mut impl RpcSender,
     ) -> Result<()> {
         match method {
             "thread/started" => {
@@ -704,6 +782,12 @@ impl App {
             "item/agentMessage/delta" => self.handle_agent_delta(&params),
             "item/reasoning/summaryTextDelta" => self.handle_reasoning_delta(&params),
             "item/reasoning/summaryPartAdded" => self.handle_reasoning_part(&params),
+            "skills/changed" => {
+                self.skills_by_cwd.clear();
+                if let Some(cwd) = self.skill_picker.as_ref().map(|picker| picker.cwd.clone()) {
+                    self.request_skills(&cwd, true, sender)?;
+                }
+            }
             "error" | "warning" | "configWarning" | "deprecationNotice" => {
                 self.notice = notification_message(&params).unwrap_or_else(|| method.to_string());
             }
@@ -917,6 +1001,7 @@ impl App {
                 return Ok(());
             }
             self.composer.take();
+            self.composer.take_skills();
             self.cache_current_draft();
             self.answer_pending_request(&thread_id, &text, sender)?;
             return Ok(());
@@ -929,6 +1014,7 @@ impl App {
         let draft = PromptDraft {
             text,
             images: self.composer.take_images(),
+            skills: self.composer.take_skills(),
         };
         self.cache_current_draft();
         self.scroll_back = 0;
@@ -1396,6 +1482,163 @@ impl App {
         Ok(())
     }
 
+    fn handle_skill_picker_key(&mut self, key: KeyEvent) -> bool {
+        if self.skill_picker.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.skill_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Down => {
+                let item_count = self
+                    .skill_picker_view()
+                    .map(|view| view.items.len())
+                    .unwrap_or_default();
+                if let Some(picker) = &mut self.skill_picker {
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(1)
+                        .min(item_count.saturating_sub(1));
+                }
+                true
+            }
+            KeyCode::Enter
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ) =>
+            {
+                let loading = self.skill_picker_view().is_some_and(|view| view.loading);
+                let handled = self.accept_selected_skill() || loading;
+                if !handled {
+                    self.skill_picker = None;
+                }
+                handled
+            }
+            KeyCode::Tab => {
+                self.accept_selected_skill();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn accept_selected_skill(&mut self) -> bool {
+        let Some(picker) = self.skill_picker.clone() else {
+            return false;
+        };
+        let Some(skill) = self
+            .skill_picker_view()
+            .and_then(|view| view.items.get(view.selected).cloned())
+        else {
+            return false;
+        };
+        let name = skill.name.clone();
+        self.composer.replace_with_skill(
+            picker.query_start,
+            SkillReference {
+                name: skill.name,
+                path: skill.path,
+            },
+        );
+        self.skill_picker = None;
+        self.notice = format!("Selected ${name}");
+        true
+    }
+
+    fn sync_skill_picker(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        if self.composer.target == ComposeTarget::Rename
+            || (self.composer.target == ComposeTarget::Reply
+                && self
+                    .selected_session()
+                    .is_some_and(|session| self.has_pending_request(&session.id)))
+        {
+            self.skill_picker = None;
+            return Ok(());
+        }
+        let Some((query_start, query)) =
+            active_skill_query(&self.composer.text, self.composer.cursor)
+        else {
+            self.skill_picker = None;
+            return Ok(());
+        };
+        let cwd = self.skill_context_cwd();
+        match &mut self.skill_picker {
+            Some(picker) if picker.cwd == cwd && picker.query_start == query_start => {
+                if picker.query != query {
+                    picker.query = query;
+                    picker.selected = 0;
+                }
+            }
+            _ => {
+                self.skill_picker = Some(SkillPicker {
+                    cwd: cwd.clone(),
+                    query_start,
+                    query,
+                    selected: 0,
+                });
+            }
+        }
+        if !self.skills_by_cwd.contains_key(&cwd) {
+            self.request_skills(&cwd, false, sender)?;
+        }
+        self.clamp_skill_picker_selection();
+        Ok(())
+    }
+
+    fn clamp_skill_picker_selection(&mut self) {
+        let item_count = self
+            .skill_picker_view()
+            .map(|view| view.items.len())
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.skill_picker {
+            picker.selected = picker.selected.min(item_count.saturating_sub(1));
+        }
+    }
+
+    fn skill_context_cwd(&self) -> String {
+        if self.composer.target == ComposeTarget::Reply
+            && let Some(cwd) = self
+                .selected_session()
+                .map(|session| session.cwd.as_str())
+                .filter(|cwd| !cwd.is_empty())
+        {
+            return cwd.to_string();
+        }
+        self.cwd.to_string_lossy().into_owned()
+    }
+
+    fn request_skills(
+        &mut self,
+        cwd: &str,
+        force_reload: bool,
+        sender: &mut impl RpcSender,
+    ) -> Result<()> {
+        if !self.skills_inflight.insert(cwd.to_string()) {
+            return Ok(());
+        }
+        let id = match sender.request(
+            "skills/list",
+            json!({ "cwds": [cwd], "forceReload": force_reload }),
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                self.skills_inflight.remove(cwd);
+                return Err(error);
+            }
+        };
+        self.pending_calls.insert(
+            id,
+            PendingCall::SkillsList {
+                cwd: cwd.to_string(),
+            },
+        );
+        Ok(())
+    }
+
     fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
         let settings_left = key.code == KeyCode::Left
             && !key
@@ -1526,6 +1769,7 @@ impl App {
         self.composer.text = title;
         self.composer.cursor = self.composer.text.len();
         self.composer.images.clear();
+        self.composer.skills.clear();
         self.notice = "Edit the name and press Enter · Tab cancels".to_string();
     }
 
@@ -1705,6 +1949,81 @@ fn preview_verbosity_name(verbosity: PreviewVerbosity) -> &'static str {
     }
 }
 
+fn active_skill_query(text: &str, cursor: usize) -> Option<(usize, String)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    if text[cursor..]
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    let prefix = &text[..cursor];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    let query = prefix.get(start..)?.strip_prefix('$')?;
+    Some((start, query.to_string()))
+}
+
+fn skill_matches(skill: &SkillMetadata, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_ascii_lowercase();
+    skill.name.to_ascii_lowercase().contains(&query)
+        || skill.description.to_ascii_lowercase().contains(&query)
+}
+
+fn skills_from_list_response(result: &Value) -> Vec<SkillMetadata> {
+    result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("skills").and_then(Value::as_array))
+        .flatten()
+        .filter(|skill| {
+            skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .filter_map(|skill| {
+            let name = skill.get("name")?.as_str()?.to_string();
+            let path = skill.get("path")?.as_str()?.to_string();
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
+                .or_else(|| {
+                    skill
+                        .get("interface")
+                        .and_then(|interface| interface.get("shortDescription"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_string();
+            let scope = skill
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(SkillMetadata {
+                name,
+                description,
+                path,
+                scope,
+            })
+        })
+        .collect()
+}
+
 fn messages_from_thread(thread: &Value) -> Vec<MessageEntry> {
     let mut messages = Vec::new();
     let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
@@ -1739,7 +2058,9 @@ fn messages_from_thread(thread: &Value) -> Vec<MessageEntry> {
 }
 
 fn prompt_input(draft: &PromptDraft) -> Vec<Value> {
-    let mut input = Vec::with_capacity(usize::from(!draft.text.is_empty()) + draft.images.len());
+    let mut input = Vec::with_capacity(
+        usize::from(!draft.text.is_empty()) + draft.skills.len() + draft.images.len(),
+    );
     if !draft.text.is_empty() {
         input.push(json!({
             "type": "text",
@@ -1747,6 +2068,13 @@ fn prompt_input(draft: &PromptDraft) -> Vec<Value> {
             "text_elements": []
         }));
     }
+    input.extend(draft.skills.iter().map(|skill| {
+        json!({
+            "type": "skill",
+            "name": skill.name,
+            "path": skill.path
+        })
+    }));
     input.extend(draft.images.iter().map(|path| {
         json!({
             "type": "localImage",
@@ -2308,6 +2636,123 @@ mod tests {
         assert!(!app.settings_open());
         assert_eq!(app.composer.cursor, 1);
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn dollar_opens_codex_skill_picker_and_sends_structured_skill_input() {
+        let (mut app, state_path) = test_app(true);
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("type dollar");
+        assert_eq!(app.composer.text, "$");
+        assert!(app.skill_picker_view().expect("picker").loading);
+        assert_eq!(sender.requests[0].0, "skills/list");
+        assert_eq!(sender.requests[0].1["cwds"], json!(["/tmp"]));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("ignore enter while skills load");
+        assert_eq!(sender.requests.len(), 1);
+        assert_eq!(app.composer.text, "$");
+
+        app.handle_client_event(
+            ClientEvent::Message(json!({
+                "id": 1,
+                "result": {
+                    "data": [{
+                        "cwd": "/tmp",
+                        "skills": [
+                            {
+                                "name": "documents",
+                                "description": "Create and edit documents",
+                                "path": "/tmp/skills/documents/SKILL.md",
+                                "scope": "user",
+                                "enabled": true
+                            },
+                            {
+                                "name": "disabled",
+                                "description": "Hidden",
+                                "path": "/tmp/skills/disabled/SKILL.md",
+                                "scope": "user",
+                                "enabled": false
+                            }
+                        ],
+                        "errors": []
+                    }]
+                }
+            })),
+            &mut sender,
+        )
+        .expect("skills response");
+        let picker = app.skill_picker_view().expect("loaded picker");
+        assert!(!picker.loading);
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].name, "documents");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("select skill");
+        assert!(app.skill_picker_view().is_none());
+        assert_eq!(app.composer.text, "$documents ");
+        assert_eq!(app.composer.skills.len(), 1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("submit skill prompt");
+        let draft = app
+            .pending_calls
+            .values()
+            .find_map(|call| match call {
+                PendingCall::ThreadStart { draft } => Some(draft),
+                _ => None,
+            })
+            .expect("pending thread with skill draft");
+        assert_eq!(
+            prompt_input(draft),
+            vec![
+                json!({
+                    "type": "text",
+                    "text": "$documents",
+                    "text_elements": []
+                }),
+                json!({
+                    "type": "skill",
+                    "name": "documents",
+                    "path": "/tmp/skills/documents/SKILL.md"
+                })
+            ]
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn skill_query_requires_a_token_boundary_and_filters_as_you_type() {
+        assert_eq!(active_skill_query("$doc", 4), Some((0, "doc".to_string())));
+        assert_eq!(
+            active_skill_query("please $doc", 11),
+            Some((7, "doc".to_string()))
+        );
+        assert_eq!(active_skill_query("cost$doc", 8), None);
+        assert_eq!(active_skill_query("$document rest", 4), None);
+
+        let skill = SkillMetadata {
+            name: "documents".to_string(),
+            description: "Word and Google Docs".to_string(),
+            path: "/tmp/documents/SKILL.md".to_string(),
+            scope: "user".to_string(),
+        };
+        assert!(skill_matches(&skill, "doc"));
+        assert!(skill_matches(&skill, "google"));
+        assert!(!skill_matches(&skill, "slides"));
     }
 
     #[test]

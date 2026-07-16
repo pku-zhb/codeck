@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::App;
+use crate::app::{App, SkillPickerView};
 use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
 use crate::model::{ComposeTarget, MessageEntry, MessageKind, PreviewVerbosity, SessionStatus};
 
@@ -20,6 +20,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
+    let skill_picker = app.skill_picker_view();
+    let skill_picker_height = skill_picker
+        .as_ref()
+        .map(|picker| (picker.items.len().clamp(1, 6) + 1) as u16)
+        .unwrap_or_default();
     let separator_height = u16::from(area.height >= 6);
     let max_input_height = area
         .height
@@ -40,6 +45,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let available = area
         .height
         .saturating_sub(input_height)
+        .saturating_sub(skill_picker_height)
         .saturating_sub(separator_height.saturating_mul(2));
     let max_sessions = (available / 3).max(1);
     let desired_sessions = (app.sessions().len() + 3) as u16;
@@ -48,6 +54,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         Constraint::Length(session_height),
         Constraint::Length(separator_height),
         Constraint::Min(0),
+        Constraint::Length(skill_picker_height),
         Constraint::Length(separator_height),
         Constraint::Length(input_height),
     ])
@@ -56,8 +63,64 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_sessions(frame, chunks[0], app);
     render_separator(frame, chunks[1]);
     render_messages(frame, chunks[2], app);
-    render_separator(frame, chunks[3]);
-    render_composer(frame, chunks[4], app);
+    if let Some(picker) = &skill_picker {
+        render_skill_picker(frame, chunks[3], picker);
+    }
+    render_separator(frame, chunks[4]);
+    render_composer(frame, chunks[5], app);
+}
+
+fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerView) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "$ Skills",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  ↑↓ select · Enter/Tab insert",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    if picker.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if picker.loading {
+                "  Loading skills…"
+            } else {
+                "  No matching skills"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let viewport = area.height.saturating_sub(1) as usize;
+        let offset = picker.selected.saturating_add(1).saturating_sub(viewport);
+        for (index, skill) in picker.items.iter().enumerate().skip(offset).take(viewport) {
+            let selected = index == picker.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let scope = if skill.scope.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", skill.scope)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(format!("${:<24}", skill.name), style),
+                Span::styled(&skill.description, Style::default().fg(Color::Gray)),
+                Span::styled(scope, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn render_settings(frame: &mut Frame<'_>, area: Rect, selected: PreviewVerbosity) {
@@ -452,7 +515,7 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
 }
 
 fn composer_hint(app: &App) -> String {
-    let base = "←← settings · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
+    let base = "$ skills · ←← settings · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {
