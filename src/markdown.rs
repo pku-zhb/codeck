@@ -9,6 +9,8 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const TABLE_RECORD_READABLE_WIDTH: usize = 52;
+
 #[derive(Clone, Debug, Default)]
 pub struct StyledLine {
     pub spans: Vec<StyledSpan>,
@@ -693,10 +695,15 @@ fn render_table(table: TableState, width: usize) -> Vec<StyledLine> {
         return Vec::new();
     }
     let compact = compact_table_lines(&table);
-    if compact.iter().any(|line| line.width() > width) {
+    let trigger_width = table_record_trigger_width(width);
+    if compact.iter().any(|line| line.width() > trigger_width) {
         return record_table_lines(&table, width);
     }
     compact
+}
+
+fn table_record_trigger_width(width: usize) -> usize {
+    width.min(TABLE_RECORD_READABLE_WIDTH).max(1)
 }
 
 fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
@@ -1121,6 +1128,38 @@ mod tests {
             .expect("field label");
         assert_eq!(label.style.fg, Some(Color::Cyan));
         assert!(label.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_renders_readability_wide_tables_as_field_records() {
+        let lines = render_markdown(
+            "| 口径 | Taiwan | U.S. | Japan |\n\
+             |---|---:|---:|---:|\n\
+             | N3 | 约 80% | 约 10-15% | 约 5-8% |\n\
+             | N2 及更先进，旧 $165bn 计划 | 约 70% | 约 30% | 0 |\n\
+             | N2 及更先进，新增 $100bn 后 | 约 53-60% | 约 40-47% | 0 |\n\
+             | N3+ 合计，新增后 | 约 60-65% | 约 32-37% | 约 2-4% |",
+            Style::default(),
+            80,
+        );
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "口径: N2 及更先进，旧 $165bn 计划"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line == "U.S.: 约 40-47%"),
+            "rendered={rendered:?}"
+        );
+        assert_eq!(separators.len(), 5, "rendered={rendered:?}");
+        assert!(!rendered.iter().any(|line| line.contains("口径 │ Taiwan")));
     }
 
     #[test]
