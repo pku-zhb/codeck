@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::{Map, Value, json};
 
 use crate::client::{ClientEvent, RpcSender};
+use crate::clipboard::{image_paths_from_paste, save_clipboard_image};
 use crate::lifecycle::LifecycleStore;
 use crate::model::{ComposeTarget, Composer, MessageEntry, MessageKind, Session, SessionStatus};
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
@@ -17,14 +18,32 @@ const THREAD_SOURCE: &str = "codex-deck";
 #[derive(Debug)]
 enum PendingCall {
     Initialize,
-    ThreadList { paginate: bool },
-    ThreadRead { thread_id: String },
-    ThreadStart { prompt: String },
-    ThreadResumeForReply { thread_id: String, prompt: String },
-    TurnStart { thread_id: String },
-    TurnSteer { thread_id: String },
-    TurnInterrupt { thread_id: String },
-    ThreadNameSet { thread_id: String, name: String },
+    ThreadList {
+        paginate: bool,
+    },
+    ThreadRead {
+        thread_id: String,
+    },
+    ThreadStart {
+        draft: PromptDraft,
+    },
+    ThreadResumeForReply {
+        thread_id: String,
+        draft: PromptDraft,
+    },
+    TurnStart {
+        thread_id: String,
+    },
+    TurnSteer {
+        thread_id: String,
+    },
+    TurnInterrupt {
+        thread_id: String,
+    },
+    ThreadNameSet {
+        thread_id: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +81,12 @@ struct PendingRequest {
 pub struct AttachRequest {
     pub thread_id: String,
     pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct PromptDraft {
+    text: String,
+    images: Vec<PathBuf>,
 }
 
 pub struct App {
@@ -188,6 +213,11 @@ impl App {
             self.attach_right_armed = false;
         }
 
+        if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
+            self.paste_clipboard_image();
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -207,6 +237,11 @@ impl App {
                 KeyCode::Char('u') => {
                     self.composer.text.clear();
                     self.composer.cursor = 0;
+                    self.composer.images.clear();
+                    return Ok(());
+                }
+                KeyCode::Char('v') => {
+                    self.paste_clipboard_image();
                     return Ok(());
                 }
                 KeyCode::Char('t') => {
@@ -242,6 +277,12 @@ impl App {
                 self.submit(sender)?
             }
             KeyCode::Enter => self.submit(sender)?,
+            KeyCode::Backspace
+                if self.composer.text.is_empty() && !self.composer.images.is_empty() =>
+            {
+                self.composer.images.pop();
+                self.notice = "Removed last image".to_string();
+            }
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Left => self.composer.move_left(),
@@ -265,6 +306,56 @@ impl App {
     pub fn insert_text(&mut self, text: &str) {
         self.attach_right_armed = false;
         self.composer.insert(text);
+    }
+
+    pub fn insert_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            self.paste_clipboard_image();
+            return;
+        }
+        let paths = image_paths_from_paste(text);
+        if paths.is_empty() {
+            self.insert_text(text);
+        } else {
+            self.add_images(paths);
+        }
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        match save_clipboard_image() {
+            Ok(Some(path)) => self.add_images(vec![path]),
+            Ok(None) => {
+                self.notice = "Clipboard does not contain an image".to_string();
+            }
+            Err(error) => {
+                self.notice = format!("Could not paste clipboard image: {error:#}");
+            }
+        }
+    }
+
+    fn add_images(&mut self, paths: Vec<PathBuf>) {
+        let before = self.composer.images.len();
+        for path in paths {
+            if !self.composer.images.contains(&path) {
+                self.composer.images.push(path);
+            }
+        }
+        let added = self.composer.images.len().saturating_sub(before);
+        self.attach_right_armed = false;
+        self.notice = if added == 0 {
+            "Image is already attached".to_string()
+        } else {
+            format!(
+                "Attached {added} image{} · Backspace on empty input removes the last one",
+                if added == 1 { "" } else { "s" }
+            )
+        };
+    }
+
+    fn restore_draft(&mut self, draft: PromptDraft) {
+        self.composer.text = draft.text;
+        self.composer.cursor = self.composer.text.len();
+        self.composer.images = draft.images;
     }
 
     pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
@@ -419,7 +510,7 @@ impl App {
                     self.apply_thread_history(&thread_id, thread);
                 }
             }
-            PendingCall::ThreadStart { prompt } => {
+            PendingCall::ThreadStart { draft } => {
                 let thread = result
                     .get("thread")
                     .context("thread/start response missing thread")?;
@@ -430,9 +521,9 @@ impl App {
                 self.merge_session(session);
                 self.select_session(&thread_id);
                 self.composer.target = ComposeTarget::Reply;
-                self.start_turn(&thread_id, &prompt, sender)?;
+                self.start_turn(&thread_id, &draft, sender)?;
             }
-            PendingCall::ThreadResumeForReply { thread_id, prompt } => {
+            PendingCall::ThreadResumeForReply { thread_id, draft } => {
                 let thread = result.get("thread").unwrap_or(&Value::Null);
                 self.apply_resumed_thread(&thread_id, thread);
                 let status = thread
@@ -440,6 +531,15 @@ impl App {
                     .map(SessionStatus::from_protocol)
                     .unwrap_or(SessionStatus::Completed);
                 if status == SessionStatus::NeedsInput {
+                    if !draft.images.is_empty() {
+                        self.add_images(draft.images);
+                    }
+                    let prompt = draft.text;
+                    if prompt.is_empty() {
+                        self.notice =
+                            "Session needs a text answer; attached images were kept".to_string();
+                        return Ok(());
+                    }
                     if self.has_pending_request(&thread_id) {
                         self.answer_pending_request(&thread_id, &prompt, sender)?;
                     } else {
@@ -448,12 +548,12 @@ impl App {
                     }
                 } else if status == SessionStatus::Working {
                     if let Some(turn_id) = active_turn_id(thread) {
-                        self.steer_turn(&thread_id, &turn_id, &prompt, sender)?;
+                        self.steer_turn(&thread_id, &turn_id, &draft, sender)?;
                     } else {
                         self.notice = "Session is active; waiting for turn state".to_string();
                     }
                 } else {
-                    self.start_turn(&thread_id, &prompt, sender)?;
+                    self.start_turn(&thread_id, &draft, sender)?;
                 }
             }
             PendingCall::TurnStart { thread_id } => {
@@ -725,11 +825,54 @@ impl App {
 
     fn submit(&mut self, sender: &mut impl RpcSender) -> Result<()> {
         let text = self.composer.text.trim().to_string();
-        if text.is_empty() {
+        let target = self.composer.target;
+        if target == ComposeTarget::Rename {
+            if text.is_empty() {
+                return Ok(());
+            }
+            self.composer.take();
+            let Some(thread_id) = self.rename_thread_id.clone() else {
+                self.cancel_rename();
+                self.notice = "Rename target is no longer available".to_string();
+                return Ok(());
+            };
+            let id = sender.request(
+                "thread/name/set",
+                json!({ "threadId": thread_id, "name": text }),
+            )?;
+            self.pending_calls.insert(
+                id,
+                PendingCall::ThreadNameSet {
+                    thread_id,
+                    name: text,
+                },
+            );
+            self.notice = "Renaming session…".to_string();
             return Ok(());
         }
-        let target = self.composer.target;
+
+        if target == ComposeTarget::Reply
+            && let Some(thread_id) = self.selected_session().map(|session| session.id.clone())
+            && self.has_pending_request(&thread_id)
+        {
+            if text.is_empty() {
+                self.notice =
+                    "This request needs a text answer; attached images were kept".to_string();
+                return Ok(());
+            }
+            self.composer.take();
+            self.answer_pending_request(&thread_id, &text, sender)?;
+            return Ok(());
+        }
+
+        if text.is_empty() && self.composer.images.is_empty() {
+            return Ok(());
+        }
         self.composer.take();
+        let draft = PromptDraft {
+            text,
+            images: self.composer.take_images(),
+        };
         self.scroll_back = 0;
 
         match target {
@@ -744,7 +887,7 @@ impl App {
                     }),
                 )?;
                 self.pending_calls
-                    .insert(id, PendingCall::ThreadStart { prompt: text });
+                    .insert(id, PendingCall::ThreadStart { draft });
                 self.notice = "Starting background session…".to_string();
             }
             ComposeTarget::Reply => {
@@ -752,15 +895,10 @@ impl App {
                 else {
                     self.notice = "No session selected; switched to new task".to_string();
                     self.composer.target = ComposeTarget::NewTask;
-                    self.composer.insert(&text);
+                    self.restore_draft(draft);
                     return Ok(());
                 };
                 self.track_session(&thread_id)?;
-
-                if self.has_pending_request(&thread_id) {
-                    self.answer_pending_request(&thread_id, &text, sender)?;
-                    return Ok(());
-                }
 
                 let status = self
                     .session(&thread_id)
@@ -772,38 +910,15 @@ impl App {
                 if status == SessionStatus::Working
                     && let Some(turn_id) = active_turn_id
                 {
-                    self.steer_turn(&thread_id, &turn_id, &text, sender)?;
+                    self.steer_turn(&thread_id, &turn_id, &draft, sender)?;
                 } else {
                     let id = sender.request("thread/resume", json!({ "threadId": thread_id }))?;
-                    self.pending_calls.insert(
-                        id,
-                        PendingCall::ThreadResumeForReply {
-                            thread_id,
-                            prompt: text,
-                        },
-                    );
+                    self.pending_calls
+                        .insert(id, PendingCall::ThreadResumeForReply { thread_id, draft });
                     self.notice = "Resuming session…".to_string();
                 }
             }
-            ComposeTarget::Rename => {
-                let Some(thread_id) = self.rename_thread_id.clone() else {
-                    self.cancel_rename();
-                    self.notice = "Rename target is no longer available".to_string();
-                    return Ok(());
-                };
-                let id = sender.request(
-                    "thread/name/set",
-                    json!({ "threadId": thread_id, "name": text }),
-                )?;
-                self.pending_calls.insert(
-                    id,
-                    PendingCall::ThreadNameSet {
-                        thread_id,
-                        name: text,
-                    },
-                );
-                self.notice = "Renaming session…".to_string();
-            }
+            ComposeTarget::Rename => unreachable!("rename handled above"),
         }
         Ok(())
     }
@@ -811,18 +926,14 @@ impl App {
     fn start_turn(
         &mut self,
         thread_id: &str,
-        prompt: &str,
+        draft: &PromptDraft,
         sender: &mut impl RpcSender,
     ) -> Result<()> {
         let id = sender.request(
             "turn/start",
             json!({
                 "threadId": thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": []
-                }],
+                "input": prompt_input(draft),
                 "summary": "auto"
             }),
         )?;
@@ -837,7 +948,7 @@ impl App {
             session.upsert_message(MessageEntry {
                 id: format!("local-user-{id}"),
                 kind: MessageKind::User,
-                text: prompt.to_string(),
+                text: draft_display(draft),
             });
         }
         self.sort_sessions_preserving_selection();
@@ -848,7 +959,7 @@ impl App {
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        prompt: &str,
+        draft: &PromptDraft,
         sender: &mut impl RpcSender,
     ) -> Result<()> {
         let id = sender.request(
@@ -856,11 +967,7 @@ impl App {
             json!({
                 "threadId": thread_id,
                 "expectedTurnId": turn_id,
-                "input": [{
-                    "type": "text",
-                    "text": prompt,
-                    "text_elements": []
-                }]
+                "input": prompt_input(draft)
             }),
         )?;
         self.pending_calls.insert(
@@ -873,7 +980,7 @@ impl App {
             session.upsert_message(MessageEntry {
                 id: format!("local-user-{id}"),
                 kind: MessageKind::User,
-                text: prompt.to_string(),
+                text: draft_display(draft),
             });
         }
         self.notice = "Sending follow-up…".to_string();
@@ -1236,6 +1343,7 @@ impl App {
         self.composer.target = ComposeTarget::Rename;
         self.composer.text = title;
         self.composer.cursor = self.composer.text.len();
+        self.composer.images.clear();
         self.notice = "Edit the name and press Enter · Tab cancels".to_string();
     }
 
@@ -1427,6 +1535,38 @@ fn messages_from_thread(thread: &Value) -> Vec<MessageEntry> {
     messages
 }
 
+fn prompt_input(draft: &PromptDraft) -> Vec<Value> {
+    let mut input = Vec::with_capacity(usize::from(!draft.text.is_empty()) + draft.images.len());
+    if !draft.text.is_empty() {
+        input.push(json!({
+            "type": "text",
+            "text": draft.text,
+            "text_elements": []
+        }));
+    }
+    input.extend(draft.images.iter().map(|path| {
+        json!({
+            "type": "localImage",
+            "path": path.to_string_lossy()
+        })
+    }));
+    input
+}
+
+fn draft_display(draft: &PromptDraft) -> String {
+    let image_label = match draft.images.len() {
+        0 => String::new(),
+        1 => "🖼 1 image".to_string(),
+        count => format!("🖼 {count} images"),
+    };
+    match (draft.text.is_empty(), image_label.is_empty()) {
+        (false, false) => format!("{}\n\n{}", draft.text, image_label),
+        (false, true) => draft.text.clone(),
+        (true, false) => image_label,
+        (true, true) => String::new(),
+    }
+}
+
 fn message_from_item(item: &Value) -> Option<MessageEntry> {
     let item_type = item.get("type")?.as_str()?;
     let id = item.get("id")?.as_str()?.to_string();
@@ -1496,12 +1636,14 @@ fn user_input_text(content: Option<&Value>) -> String {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|part| {
-            if part.get("type").and_then(Value::as_str) == Some("text") {
-                part.get("text").and_then(Value::as_str)
-            } else {
-                None
-            }
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            Some("localImage") => Some("🖼 local image".to_string()),
+            Some("image") => Some("🖼 image".to_string()),
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1965,6 +2107,7 @@ mod tests {
         app.composer.target = ComposeTarget::Reply;
         app.composer.text = "saved draft".to_string();
         app.composer.cursor = app.composer.text.len();
+        app.composer.images.push(PathBuf::from("/tmp/draft.png"));
         app.start_rename();
         app.composer.text = "New name".to_string();
         app.composer.cursor = app.composer.text.len();
@@ -1984,7 +2127,54 @@ mod tests {
         assert_eq!(app.sessions[0].title, "New name");
         assert_eq!(app.composer.target, ComposeTarget::Reply);
         assert_eq!(app.composer.text, "saved draft");
+        assert_eq!(app.composer.images, vec![PathBuf::from("/tmp/draft.png")]);
         let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn image_only_reply_is_sent_as_local_image_input() {
+        let (mut app, state_path) = test_app(false);
+        let mut session = test_session("image-thread", "Image", SessionStatus::Working);
+        session.active_turn_id = Some("turn-1".to_string());
+        app.sessions.push(session);
+        app.composer.target = ComposeTarget::Reply;
+        app.composer.images.push(PathBuf::from("/tmp/pasted.png"));
+        let mut sender = test_sender();
+
+        app.submit(&mut sender).expect("submit image reply");
+
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "turn/steer".to_string(),
+                json!({
+                    "threadId":"image-thread",
+                    "expectedTurnId":"turn-1",
+                    "input":[{"type":"localImage","path":"/tmp/pasted.png"}]
+                })
+            ))
+        );
+        assert!(app.composer.images.is_empty());
+        assert_eq!(
+            app.sessions[0]
+                .messages
+                .last()
+                .expect("local user message")
+                .text,
+            "🖼 1 image"
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn history_parser_keeps_image_only_user_messages_visible() {
+        assert_eq!(
+            user_input_text(Some(&json!([
+                {"type":"text","text":"Inspect this"},
+                {"type":"localImage","path":"/tmp/pasted.png"}
+            ]))),
+            "Inspect this\n🖼 local image"
+        );
     }
 
     #[test]

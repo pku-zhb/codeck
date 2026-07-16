@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod clipboard;
 mod lifecycle;
 mod markdown;
 mod model;
@@ -138,7 +139,7 @@ fn run_event_loop(
         if event::poll(Duration::from_millis(100)).context("poll terminal event")? {
             match event::read().context("read terminal event")? {
                 Event::Key(key) => app.handle_key(key, client)?,
-                Event::Paste(text) => app.insert_text(&text),
+                Event::Paste(text) => app.insert_paste(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

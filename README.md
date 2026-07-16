@@ -53,6 +53,8 @@ codex-deck --check
   TUI when the composer is empty; holding the key does not confirm attach
 - `Tab`: switch the composer between a new task and a reply
 - `Ctrl+N`: compose a new task
+- `Ctrl+V` (or `Cmd+V` when the terminal forwards it): attach an image from the
+  system clipboard; pasting one or more image file paths also attaches them
 - `Ctrl+T`: pin or unpin the selected session
 - `Ctrl+R`: rename the selected session
 - `Ctrl+X`: stop a working session; remove a completed/failed session from the
@@ -60,6 +62,10 @@ codex-deck --check
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
 - `Ctrl+C`: close the dashboard; running tasks continue
+
+Attached images are shown as an `🖼N` counter in the composer and are sent as
+native Codex `localImage` inputs. With an empty text field, `Backspace` removes
+the most recently attached image. Image-only prompts are supported.
 
 While attached, use native Codex normally. Run `/exit` to return to the deck;
 the dashboard reconnects to the same app-server and refreshes the transcript.

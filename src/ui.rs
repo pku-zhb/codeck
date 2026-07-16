@@ -22,8 +22,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(separator_height.saturating_mul(2))
         .saturating_sub(2)
         .max(1);
+    let input_prefix = composer_prefix(
+        app.composer().target,
+        app.selected_has_pending_request(),
+        app.composer().images.len(),
+    );
     let input_height = composer_height(
-        composer_prefix(app.composer().target, app.selected_has_pending_request()),
+        &input_prefix,
         &app.composer().text,
         area.width as usize,
         max_input_height,
@@ -293,7 +298,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let pending = app.selected_has_pending_request();
-    let prefix = composer_prefix(app.composer().target, pending);
+    let prefix = composer_prefix(app.composer().target, pending, app.composer().images.len());
     let prefix_style = match app.composer().target {
         ComposeTarget::NewTask => Style::default().fg(Color::Green),
         ComposeTarget::Reply if pending => Style::default().fg(Color::Yellow),
@@ -312,8 +317,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let source_row = offset + row;
         let text = all_lines.get(source_row).cloned().unwrap_or_default();
         if source_row == 0 {
-            let rest = text.strip_prefix(prefix).unwrap_or(&text).to_string();
-            let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+            let rest = text.strip_prefix(&prefix).unwrap_or(&text).to_string();
+            let mut spans = vec![Span::styled(prefix.clone(), prefix_style)];
             if rest.is_empty() && app.composer().text.is_empty() {
                 spans.push(Span::styled(composer_hint(app), dim_style()));
             } else {
@@ -337,12 +342,17 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn composer_prefix(target: ComposeTarget, pending: bool) -> &'static str {
-    match target {
+fn composer_prefix(target: ComposeTarget, pending: bool, image_count: usize) -> String {
+    let base = match target {
         ComposeTarget::NewTask => "＋ new › ",
         ComposeTarget::Reply if pending => "？ answer › ",
         ComposeTarget::Reply => "↳ reply › ",
         ComposeTarget::Rename => "✎ rename › ",
+    };
+    if image_count == 0 {
+        base.to_string()
+    } else {
+        format!("{}🖼{} ", base, image_count)
     }
 }
 
@@ -353,8 +363,7 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
 }
 
 fn composer_hint(app: &App) -> String {
-    let base =
-        "→→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
+    let base = "Ctrl+V image · →→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {
@@ -451,6 +460,10 @@ mod tests {
         assert_eq!(composer_height("＋ new › ", "", 40, 10), 1);
         assert_eq!(composer_height("＋ new › ", "1234567890", 10, 10), 2);
         assert_eq!(composer_height("＋ new › ", "\nsecond\nthird", 40, 2), 2);
+        assert_eq!(
+            composer_prefix(ComposeTarget::Reply, false, 2),
+            "↳ reply › 🖼2 "
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
@@ -178,6 +178,7 @@ pub struct Composer {
     pub text: String,
     pub cursor: usize,
     pub target: ComposeTarget,
+    pub images: Vec<PathBuf>,
 }
 
 impl Default for Composer {
@@ -186,6 +187,7 @@ impl Default for Composer {
             text: String::new(),
             cursor: 0,
             target: ComposeTarget::NewTask,
+            images: Vec::new(),
         }
     }
 }
@@ -243,6 +245,10 @@ impl Composer {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    pub fn take_images(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.images)
     }
 }
 
