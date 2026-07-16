@@ -546,10 +546,10 @@ fn render_table(table: TableState, width: usize) -> Vec<StyledLine> {
         return Vec::new();
     }
     let compact = compact_table_lines(&table);
-    if compact.iter().all(|line| line.width() <= width) {
-        return compact;
+    if compact.iter().any(|line| line.width() > width) {
+        return record_table_lines(&table, width);
     }
-    record_table_lines(&table, width)
+    compact
 }
 
 fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
@@ -578,16 +578,16 @@ fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
         .position(|row| row.is_header)
         .unwrap_or_default();
     let headers = &table.rows[header_index];
-    let mut output = Vec::new();
     let rows = table
         .rows
         .iter()
         .enumerate()
         .filter(|(index, row)| *index != header_index && !row.is_header)
         .collect::<Vec<_>>();
+    let mut output = Vec::new();
 
-    for (row_position, (_, row)) in rows.iter().enumerate() {
-        let before = output.len();
+    for (_, row) in rows {
+        let mut row_lines = Vec::new();
         for (index, cell) in row.cells.iter().enumerate() {
             if cell_is_empty(cell) {
                 continue;
@@ -605,21 +605,28 @@ fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
             for span in &cell.spans {
                 line.push(span.text.clone(), span.style, span.link.clone());
             }
-            output.push(line);
+            row_lines.push(line);
         }
-        if output.len() > before && row_position + 1 < rows.len() {
-            output.push(StyledLine::from_span(
-                "─".repeat(width.min(80).max(1)),
-                Style::default().fg(Color::DarkGray),
-            ));
+        if row_lines.is_empty() {
+            continue;
         }
+        output.push(table_separator(width));
+        output.extend(row_lines);
     }
 
     if output.is_empty() {
         compact_table_lines(table)
     } else {
+        output.push(table_separator(width));
         output
     }
+}
+
+fn table_separator(width: usize) -> StyledLine {
+    StyledLine::from_span(
+        "─".repeat(width.min(80).max(1)),
+        Style::default().fg(Color::DarkGray),
+    )
 }
 
 fn table_header_label(cell: Option<&StyledLine>, index: usize) -> String {
@@ -874,11 +881,16 @@ mod tests {
         let lines = render_markdown(
             "| 公司 | 代码 | 核心逻辑 |\n\
              | --- | --- | --- |\n\
-             | 英伟达 | NVDA | 数据中心 GPU 需求持续超预期，Blackwell 架构爬坡顺利 |",
+             | 英伟达 | NVDA | AI |\n\
+             | 台积电 | TSM | 先进制程供应吃紧，CoWoS 封装产能持续扩张 |",
             Style::default(),
             28,
         );
         let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .collect::<Vec<_>>();
 
         assert!(
             rendered.iter().any(|line| line == "公司: 英伟达"),
@@ -889,9 +901,21 @@ mod tests {
             "rendered={rendered:?}"
         );
         assert!(
-            rendered.iter().any(|line| line.starts_with("核心逻辑:")),
+            rendered.iter().any(|line| line == "核心逻辑: AI"),
             "rendered={rendered:?}"
         );
+        assert!(
+            rendered.iter().any(|line| line == "公司: 台积电"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("核心逻辑: 先进制程")),
+            "rendered={rendered:?}"
+        );
+        assert_eq!(separators.len(), 3, "rendered={rendered:?}");
+        assert_eq!(UnicodeWidthStr::width(separators[0].as_str()), 28);
         assert!(!rendered.iter().any(|line| line.contains("公司 │ 代码")));
 
         let label = lines
