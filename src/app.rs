@@ -2183,22 +2183,10 @@ impl App {
     fn sort_sessions(&mut self) {
         let lifecycle = &self.lifecycle;
         self.sessions.sort_by(|left, right| {
-            let left_group = if lifecycle.is_pinned(&left.id) {
-                0
-            } else if left.status.is_live() {
-                1
-            } else {
-                2
-            };
-            let right_group = if lifecycle.is_pinned(&right.id) {
-                0
-            } else if right.status.is_live() {
-                1
-            } else {
-                2
-            };
-            left_group
-                .cmp(&right_group)
+            let left_pin_rank = u8::from(!lifecycle.is_pinned(&left.id));
+            let right_pin_rank = u8::from(!lifecycle.is_pinned(&right.id));
+            left_pin_rank
+                .cmp(&right_pin_rank)
                 .then_with(|| left.status.sort_rank().cmp(&right.status.sort_rank()))
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| left.title.cmp(&right.title))
@@ -3312,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn pin_persists_and_moves_session_into_the_first_group() {
+    fn pin_persists_and_moves_session_to_the_top() {
         let (mut app, state_path) = test_app(false);
         app.sessions.push(test_session(
             "working-thread",
@@ -3332,6 +3320,35 @@ mod tests {
         assert!(app.lifecycle.is_pinned("completed-thread"));
         let restored = LifecycleStore::for_test(state_path.clone());
         assert!(restored.is_pinned("completed-thread"));
+        std::fs::remove_file(state_path).expect("remove lifecycle state");
+    }
+
+    #[test]
+    fn sessions_sort_by_pin_then_status_then_latest_reply() {
+        let (mut app, state_path) = test_app(false);
+        let mut pinned = test_session("pinned", "Pinned", SessionStatus::Completed);
+        pinned.updated_at = 1;
+        let mut older_working =
+            test_session("older-working", "Older working", SessionStatus::Working);
+        older_working.updated_at = 10;
+        let mut newer_working =
+            test_session("newer-working", "Newer working", SessionStatus::Working);
+        newer_working.updated_at = 20;
+        let mut completed = test_session("completed", "Completed", SessionStatus::Completed);
+        completed.updated_at = 30;
+        app.sessions = vec![completed, older_working, pinned, newer_working];
+        app.lifecycle.toggle_pin("pinned");
+        app.lifecycle.save().expect("save lifecycle state");
+
+        app.sort_sessions();
+
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pinned", "newer-working", "older-working", "completed"]
+        );
         std::fs::remove_file(state_path).expect("remove lifecycle state");
     }
 

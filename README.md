@@ -32,11 +32,11 @@ codex-deck -C /path/to/project
 By default, the deck is a managed lifecycle rather than a history browser. It
 automatically adopts sessions started by the deck and currently active sessions
 from other Codex clients. Completed sessions remain until you review and dismiss
-them. The list is grouped as `Pinned`, `Working`, and `Completed`; pinned sessions
-stay in the first group regardless of their current runtime status. Any session
-that is actively working shows a blinking green dot, including inside `Pinned`;
-all other sessions leave the status-light slot empty. Selection uses foreground
-color only, without a leading marker or background highlight. Historical
+them. Pinned sessions stay at the top and show a `📌` after their directory;
+the remaining sessions are ordered by status and then most recent reply. Any
+session that is actively working shows a steady green dot; all other sessions
+leave the status-light slot empty. Selection uses foreground color only, without
+a leading marker, group headers, or background highlight. Historical
 sessions outside the Deck are available from the built-in `Resume` menu tab, so
 resuming old work does not require leaving the dashboard or adding CLI flags.
 

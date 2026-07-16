@@ -53,7 +53,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(skill_picker_height)
         .saturating_sub(separator_height.saturating_mul(2));
     let max_sessions = (available / 3).max(1);
-    let desired_sessions = (app.sessions().len() + 3) as u16;
+    let desired_sessions = app.sessions().len() as u16;
     let session_height = desired_sessions.min(max_sessions).min(available);
     let chunks = Layout::vertical([
         Constraint::Length(session_height),
@@ -278,7 +278,9 @@ fn render_resume_tab(
     } else {
         let offset = selected.saturating_add(1).saturating_sub(viewport.max(1));
         lines.extend(items.iter().enumerate().skip(offset).take(viewport).map(
-            |(index, session)| session_line(session, index == selected, panel.width as usize),
+            |(index, session)| {
+                session_line(session, false, index == selected, panel.width as usize)
+            },
         ));
     }
     while lines.len() + 1 < panel.height as usize {
@@ -321,51 +323,23 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     let selected = app.selected_index();
-    let groups = [
-        (SessionGroup::Pinned, "Pinned", Color::Green),
-        (SessionGroup::Working, "Working", Color::Green),
-        (SessionGroup::Completed, "Completed", Color::Green),
-    ];
-    let mut rows = Vec::with_capacity(app.sessions().len() + groups.len());
-    for (group, label, color) in groups {
-        let count = app
-            .sessions()
-            .iter()
-            .filter(|session| session_group(app.is_pinned(&session.id), session.status) == group)
-            .count();
-        rows.push((
-            None,
-            Line::from(vec![
-                Span::styled(
-                    label,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {count}"), Style::default().fg(Color::DarkGray)),
-            ]),
-        ));
-        rows.extend(
-            app.sessions()
-                .iter()
-                .enumerate()
-                .filter(|(_, session)| {
-                    session_group(app.is_pinned(&session.id), session.status) == group
-                })
-                .map(|(index, session)| {
-                    (
-                        Some(index),
-                        session_line(session, index == selected, area.width as usize),
-                    )
-                }),
-        );
-    }
+    let rows = app
+        .sessions()
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            session_line(
+                session,
+                app.is_pinned(&session.id),
+                index == selected,
+                area.width as usize,
+            )
+        })
+        .collect::<Vec<_>>();
 
     let height = area.height as usize;
-    let selected_row = rows
-        .iter()
-        .position(|(index, _)| *index == Some(selected))
-        .unwrap_or_default();
-    let offset = if selected_row >= height {
-        selected_row + 1 - height
+    let offset = if selected >= height {
+        selected + 1 - height
     } else {
         0
     };
@@ -373,29 +347,16 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .into_iter()
         .skip(offset)
         .take(height)
-        .map(|(_, line)| line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionGroup {
-    Pinned,
-    Working,
-    Completed,
-}
-
-fn session_group(pinned: bool, status: SessionStatus) -> SessionGroup {
-    if pinned {
-        SessionGroup::Pinned
-    } else if status.is_live() {
-        SessionGroup::Working
-    } else {
-        SessionGroup::Completed
-    }
-}
-
-fn session_line(session: &crate::model::Session, selected: bool, width: usize) -> Line<'static> {
+fn session_line(
+    session: &crate::model::Session,
+    pinned: bool,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
     let row_style = if selected {
         Style::default()
             .fg(Color::Cyan)
@@ -406,13 +367,15 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
     let working = session.status == SessionStatus::Working;
     let lamp = if working { "● " } else { "  " };
     let lamp_style = if working {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::SLOW_BLINK)
+        Style::default().fg(Color::Green)
     } else {
         Style::default()
     };
-    let right = session.leaf_directory();
+    let right = if pinned {
+        format!("{} 📌", session.leaf_directory())
+    } else {
+        session.leaf_directory()
+    };
     let prefix_width = UnicodeWidthStr::width(lamp);
     let right_width = UnicodeWidthStr::width(right.as_str());
     let title_budget = width
@@ -848,7 +811,7 @@ mod tests {
             history_loaded: true,
         };
 
-        let line = session_line(&session, true, 40);
+        let line = session_line(&session, false, true, 40);
         assert_eq!(line.style.fg, Some(Color::Cyan));
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
@@ -857,7 +820,7 @@ mod tests {
         assert_eq!(line.spans[0].content, "● ");
         assert_eq!(line.spans[0].style.fg, Some(Color::Green));
         assert!(
-            line.spans[0]
+            !line.spans[0]
                 .style
                 .add_modifier
                 .contains(Modifier::SLOW_BLINK)
@@ -886,7 +849,7 @@ mod tests {
                 history_loaded: true,
             };
 
-            let line = session_line(&session, false, 40);
+            let line = session_line(&session, false, false, 40);
             assert_eq!(line.spans[0].content, "  ");
             assert!(!line.spans.iter().any(|span| span.content.contains('●')));
             assert!(!line.spans.iter().any(|span| span.content.contains('›')));
@@ -895,19 +858,24 @@ mod tests {
     }
 
     #[test]
-    fn pinned_group_takes_precedence_over_runtime_status() {
-        assert_eq!(
-            session_group(true, SessionStatus::Completed),
-            SessionGroup::Pinned
-        );
-        assert_eq!(
-            session_group(false, SessionStatus::NeedsInput),
-            SessionGroup::Working
-        );
-        assert_eq!(
-            session_group(false, SessionStatus::Failed),
-            SessionGroup::Completed
-        );
+    fn pinned_session_shows_pin_after_directory() {
+        let session = Session {
+            id: "thread".to_string(),
+            title: "Pinned session".to_string(),
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            path: None,
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some("codex-deck".to_string()),
+            status: SessionStatus::Completed,
+            active_turn_id: None,
+            messages: Vec::new(),
+            history_loaded: true,
+        };
+
+        let line = session_line(&session, true, false, 40);
+        assert_eq!(line.spans[3].content, "project 📌");
     }
 
     #[test]
