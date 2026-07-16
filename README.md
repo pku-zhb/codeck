@@ -89,8 +89,8 @@ Drafts are isolated by intent: `New` has one global draft, while `Reply` keeps a
 separate in-memory draft for every session. Moving with `Up` / `Down` saves and
 restores the corresponding reply text, cursor, and image attachments, so a
 half-written reply cannot be sent to the newly selected session.
-When the composer is empty, its status and shortcut hint starts on the line below
-the cursor and wraps to the available terminal width. It disappears while typing.
+The composer's status and shortcut hint starts on the line below the cursor,
+wraps to the available terminal width, and remains visible while typing.
 
 The skill picker uses Codex app-server's `skills/list` result for the active
 working directory. Selected skills are sent as native structured `skill` input

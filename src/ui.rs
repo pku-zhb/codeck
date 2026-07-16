@@ -41,11 +41,11 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(2)
         .max(1);
     let input_prefix = composer_prefix(app.composer().target, app.selected_has_pending_request());
-    let hint = app.composer().text.is_empty().then(|| composer_hint(app));
+    let hint = composer_hint(app);
     let input_height = composer_panel_height(
         &input_prefix,
         &app.composer().text,
-        hint.as_deref(),
+        &hint,
         area.width as usize,
         max_input_height,
     );
@@ -548,17 +548,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         prefix_style,
         area.width.max(1) as usize,
     );
-    let editor_height = composer_height(
-        &prefix,
-        &app.composer().text,
-        area.width as usize,
-        area.height,
-    );
-    let hint_height = if app.composer().text.is_empty() {
-        area.height.saturating_sub(editor_height)
-    } else {
-        0
-    };
+    let hint = composer_hint(app);
+    let hint_height = (wrapped_hint_lines(&hint, area.width as usize).len() as u16)
+        .min(area.height.saturating_sub(1));
+    let editor_height = area.height.saturating_sub(hint_height).max(1);
     let chunks = Layout::vertical([
         Constraint::Length(editor_height),
         Constraint::Length(hint_height),
@@ -576,7 +569,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(Text::from(visible)), editor_area);
     if hint_area.height > 0 {
-        let hint_lines = wrapped_hint_lines(&composer_hint(app), hint_area.width as usize)
+        let hint_lines = wrapped_hint_lines(&hint, hint_area.width as usize)
             .into_iter()
             .take(hint_area.height as usize)
             .map(|line| Line::from(Span::styled(line, dim_style())))
@@ -610,23 +603,12 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
     (lines.len().min(u16::MAX as usize) as u16).clamp(1, maximum.max(1))
 }
 
-fn composer_panel_height(
-    prefix: &str,
-    text: &str,
-    hint: Option<&str>,
-    width: usize,
-    maximum: u16,
-) -> u16 {
+fn composer_panel_height(prefix: &str, text: &str, hint: &str, width: usize, maximum: u16) -> u16 {
     let maximum = maximum.max(1);
-    let editor_height = composer_height(prefix, text, width, maximum);
-    let available_hint_height = maximum.saturating_sub(editor_height);
-    let hint_height = hint
-        .map(|hint| {
-            wrapped_hint_lines(hint, width)
-                .len()
-                .min(available_hint_height as usize) as u16
-        })
-        .unwrap_or_default();
+    let hint_height = wrapped_hint_lines(hint, width)
+        .len()
+        .min(maximum.saturating_sub(1) as usize) as u16;
+    let editor_height = composer_height(prefix, text, width, maximum - hint_height);
     editor_height.saturating_add(hint_height)
 }
 
@@ -820,13 +802,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_composer_reserves_wrapped_hint_rows_below_the_cursor() {
-        assert_eq!(
-            composer_panel_height("> ", "", Some("1234567890"), 5, 10),
-            3
-        );
-        assert_eq!(composer_panel_height("> ", "", Some("1234567890"), 5, 2), 2);
-        assert_eq!(composer_panel_height("> ", "typed", None, 5, 10), 2);
+    fn composer_reserves_wrapped_hint_rows_below_the_cursor_while_typing() {
+        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 10), 3);
+        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 2), 2);
+        assert_eq!(composer_panel_height("> ", "typed", "1234567890", 5, 10), 4);
+        assert_eq!(composer_panel_height("> ", "1234567890", "hint", 5, 3), 3);
     }
 
     #[test]
