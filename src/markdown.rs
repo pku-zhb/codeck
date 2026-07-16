@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Debug, Default)]
 pub struct StyledLine {
@@ -320,7 +320,9 @@ impl MarkdownBuilder {
                     None,
                 );
             }
-            Event::SoftBreak if self.code_depth > 0 => self.continue_line(),
+            Event::SoftBreak if self.code_depth > 0 || self.current_is_field_record() => {
+                self.continue_line();
+            }
             Event::SoftBreak => self.push(" "),
             Event::HardBreak => self.continue_line(),
             Event::Rule => {
@@ -389,6 +391,16 @@ impl MarkdownBuilder {
         self.push_block_prefix();
     }
 
+    fn current_is_field_record(&self) -> bool {
+        let text = self
+            .current
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        field_label_range(&text).is_some()
+    }
+
     fn push_block_prefix(&mut self) {
         for _ in 0..self.quote_depth {
             self.current
@@ -413,7 +425,8 @@ pub fn render_markdown(text: &str, base_style: Style, width: usize) -> Vec<Style
     for event in Parser::new_ext(text, options) {
         builder.event(event);
     }
-    wrap_lines(builder.finish(), width.max(1))
+    let lines = wrap_lines(builder.finish(), width.max(1));
+    highlight_field_labels(lines)
 }
 
 pub fn apply_osc8_links(frame: &mut Frame<'_>, area: Rect, lines: &[StyledLine]) {
@@ -487,6 +500,108 @@ fn wrap_lines(lines: Vec<StyledLine>, width: usize) -> Vec<StyledLine> {
     output
 }
 
+fn highlight_field_labels(lines: Vec<StyledLine>) -> Vec<StyledLine> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            let Some((start, end)) = field_label_range(&text) else {
+                return line;
+            };
+            highlight_byte_range(line, start, end)
+        })
+        .collect()
+}
+
+fn field_label_range(text: &str) -> Option<(usize, usize)> {
+    let start = text
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))?
+        .0;
+    if UnicodeWidthStr::width(&text[..start]) > 4 {
+        return None;
+    }
+
+    let mut label_width = 0;
+    let mut has_label_char = false;
+    for (index, ch) in text[start..].char_indices() {
+        let absolute = start + index;
+        if matches!(ch, ':' | '：') {
+            if !has_label_char || label_width == 0 || label_width > 18 {
+                return None;
+            }
+            let end = absolute + ch.len_utf8();
+            if text[end..].starts_with("//") {
+                return None;
+            }
+            return Some((start, end));
+        }
+        if !is_field_label_char(ch) {
+            return None;
+        }
+        if !ch.is_whitespace() {
+            has_label_char = true;
+        }
+        label_width += ch.width().unwrap_or_default();
+    }
+    None
+}
+
+fn is_field_label_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || ch.is_whitespace()
+        || matches!(ch, '_' | '-' | '/' | '&' | '+' | '#' | '.' | '%' | '$')
+}
+
+fn highlight_byte_range(line: StyledLine, start: usize, end: usize) -> StyledLine {
+    let mut spans = Vec::new();
+    let mut consumed = 0;
+    for span in line.spans {
+        let span_start = consumed;
+        let span_end = span_start + span.text.len();
+        consumed = span_end;
+
+        if span_end <= start || span_start >= end {
+            spans.push(span);
+            continue;
+        }
+
+        let local_start = start.saturating_sub(span_start);
+        let local_end = (end.min(span_end)).saturating_sub(span_start);
+
+        if local_start > 0 {
+            spans.push(StyledSpan {
+                text: span.text[..local_start].to_string(),
+                style: span.style,
+                link: span.link.clone(),
+            });
+        }
+        if local_start < local_end {
+            spans.push(StyledSpan {
+                text: span.text[local_start..local_end].to_string(),
+                style: span.style.patch(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                link: span.link.clone(),
+            });
+        }
+        if local_end < span.text.len() {
+            spans.push(StyledSpan {
+                text: span.text[local_end..].to_string(),
+                style: span.style,
+                link: span.link,
+            });
+        }
+    }
+    StyledLine { spans }
+}
+
 fn osc8_target(destination: &str) -> Option<String> {
     if destination.chars().any(char::is_control) {
         return None;
@@ -538,6 +653,51 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.text.contains("site") && span.link.as_deref() == Some("https://example.com")
         }));
+    }
+
+    #[test]
+    fn markdown_highlights_field_labels_in_wrapped_records() {
+        let lines = render_markdown(
+            "公司：英伟达\n代码: NVDA\n核心逻辑：数据中心 GPU 需求持续超预期",
+            Style::default(),
+            80,
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+
+        for label in ["公司：", "代码:", "核心逻辑："] {
+            let span = spans
+                .iter()
+                .find(|span| span.text == label)
+                .expect("field label span");
+            assert_eq!(span.style.fg, Some(Color::Cyan));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
+        let value = spans
+            .iter()
+            .find(|span| span.text.contains("英伟达"))
+            .expect("value span");
+        assert_ne!(value.style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn markdown_does_not_highlight_urls_or_code_block_fields() {
+        let lines = render_markdown(
+            "https://example.com/path\n\n```text\n公司：英伟达\n```",
+            Style::default(),
+            80,
+        );
+        let highlighted = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(Color::Cyan))
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!highlighted.iter().any(|text| *text == "https:"));
+        assert!(!highlighted.iter().any(|text| *text == "公司："));
     }
 
     #[test]
