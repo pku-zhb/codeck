@@ -89,7 +89,9 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn session_line(session: &crate::model::Session, selected: bool, width: usize) -> Line<'static> {
     let row_style = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -118,13 +120,13 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
 
     Line::from(vec![
         Span::styled(marker.to_string(), row_style),
-        Span::styled("● ", dot_style.patch(row_style)),
+        Span::styled("● ", row_style.patch(dot_style)),
         Span::styled(title, title_style),
         Span::styled(spacer, row_style),
         Span::styled(
             right,
             if selected {
-                row_style
+                row_style.remove_modifier(Modifier::BOLD)
             } else {
                 row_style.fg(Color::DarkGray)
             },
@@ -378,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_session_uses_terminal_theme_reverse_video() {
+    fn selected_session_uses_ansi_foreground_without_background() {
         let session = Session {
             id: "thread".to_string(),
             title: "Readable selection".to_string(),
@@ -395,7 +397,9 @@ mod tests {
         };
 
         let line = session_line(&session, true, 40);
-        assert!(line.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(line.style.fg, Some(Color::Cyan));
+        assert!(line.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
         assert!(line.style.bg.is_none());
     }
 
