@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::client::{ClientEvent, RpcSender};
 use crate::model::{ComposeTarget, Composer, MessageEntry, MessageKind, Session, SessionStatus};
+use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const THREAD_SOURCE: &str = "codex-deck";
@@ -235,18 +236,14 @@ impl App {
         sender: &mut impl RpcSender,
     ) -> Result<()> {
         self.select_session(thread_id);
-        let id = sender.request(
-            "thread/read",
-            json!({ "threadId": thread_id, "includeTurns": true }),
-        )?;
-        self.pending_calls.insert(
-            id,
-            PendingCall::ThreadRead {
-                thread_id: thread_id.to_string(),
-            },
-        );
+        self.load_history(thread_id, sender)?;
         self.scroll_back = 0;
-        self.notice = "Returned from attached session".to_string();
+        if !matches!(
+            self.notice.as_str(),
+            "Large session: bounded preview" | "Transcript preview unavailable"
+        ) {
+            self.notice = "Returned from attached session".to_string();
+        }
         Ok(())
     }
 
@@ -584,13 +581,76 @@ impl App {
             return Ok(());
         }
         let thread_id = session.id.clone();
+        self.load_history(&thread_id, sender)
+    }
+
+    fn load_history(&mut self, thread_id: &str, sender: &mut impl RpcSender) -> Result<()> {
+        if self.load_bounded_history_if_large(thread_id) {
+            return Ok(());
+        }
         let id = sender.request(
             "thread/read",
             json!({ "threadId": thread_id, "includeTurns": true }),
         )?;
-        self.pending_calls
-            .insert(id, PendingCall::ThreadRead { thread_id });
+        self.pending_calls.insert(
+            id,
+            PendingCall::ThreadRead {
+                thread_id: thread_id.to_string(),
+            },
+        );
         Ok(())
+    }
+
+    fn load_bounded_history_if_large(&mut self, thread_id: &str) -> bool {
+        let Some(path) = self
+            .session(thread_id)
+            .and_then(|session| session.path.as_deref())
+            .map(PathBuf::from)
+        else {
+            return false;
+        };
+        let preview = match load_bounded_preview_if_large(&path) {
+            Ok(Some(preview)) => preview,
+            Ok(None) => return false,
+            Err(_) => {
+                if let Some(session) = self.session_mut(thread_id) {
+                    session.messages = vec![MessageEntry {
+                        id: "bounded-preview-error".to_string(),
+                        kind: MessageKind::System,
+                        text: "Transcript preview is unavailable · attach to view the full history"
+                            .to_string(),
+                    }];
+                    session.history_loaded = true;
+                }
+                self.notice = "Transcript preview unavailable".to_string();
+                return true;
+            }
+        };
+
+        let tail_kib = TAIL_PREVIEW_BYTES / 1024;
+        let file_mib = preview.file_bytes as f64 / (1024.0 * 1024.0);
+        let mut messages = vec![MessageEntry {
+            id: "bounded-preview".to_string(),
+            kind: MessageKind::System,
+            text: format!(
+                "Large session ({file_mib:.1} MiB) · showing the latest {tail_kib} KiB · attach for full history"
+            ),
+        }];
+        messages.extend(preview.messages);
+        if let Some(session) = self.session_mut(thread_id) {
+            messages.extend(
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.kind == MessageKind::Question)
+                    .cloned(),
+            );
+            session.messages = messages;
+            session.history_loaded = true;
+        }
+        self.scroll_back = 0;
+        self.notice = "Large session: bounded preview".to_string();
+        true
     }
 
     fn submit(&mut self, sender: &mut impl RpcSender) -> Result<()> {
@@ -820,6 +880,7 @@ impl App {
             existing.title = incoming.title;
             existing.preview = incoming.preview;
             existing.cwd = incoming.cwd;
+            existing.path = incoming.path;
             existing.updated_at = incoming.updated_at;
             existing.source = incoming.source;
             existing.thread_source = incoming.thread_source;
@@ -1443,6 +1504,7 @@ mod tests {
             title: "Test".to_string(),
             preview: String::new(),
             cwd: "/tmp/project".to_string(),
+            path: None,
             updated_at: 0,
             source: "appServer".to_string(),
             thread_source: Some(THREAD_SOURCE.to_string()),

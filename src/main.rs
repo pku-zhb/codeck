@@ -1,6 +1,7 @@
 mod app;
 mod client;
 mod model;
+mod transcript;
 mod ui;
 
 use std::io::{self, stdout};
@@ -19,7 +20,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Rect;
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-deck", version, about)]
@@ -175,10 +177,13 @@ fn reenter_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
         EnableBracketedPaste
     )
     .context("re-enter terminal screen")?;
-    terminal
-        .autoresize()
-        .context("resize terminal after attach")?;
+    force_full_redraw(terminal).context("redraw terminal after attach")?;
     Ok(())
+}
+
+fn force_full_redraw<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -206,6 +211,8 @@ fn install_panic_restore_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::Paragraph;
     use std::ffi::OsStr;
 
     #[test]
@@ -230,5 +237,25 @@ mod tests {
             command.get_current_dir(),
             Some(std::path::Path::new("/tmp"))
         );
+    }
+
+    #[test]
+    fn attach_return_forces_identical_content_to_be_redrawn() {
+        let mut terminal = Terminal::new(TestBackend::new(12, 2)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("deck"), frame.area()))
+            .expect("first draw");
+        terminal.backend_mut().clear().expect("simulate new screen");
+        terminal
+            .backend()
+            .assert_buffer_lines(["            ", "            "]);
+
+        force_full_redraw(&mut terminal).expect("invalidate buffers");
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("deck"), frame.area()))
+            .expect("redraw");
+        terminal
+            .backend()
+            .assert_buffer_lines(["deck        ", "            "]);
     }
 }

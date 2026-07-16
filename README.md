@@ -56,6 +56,9 @@ codex-deck --check
 
 While attached, use native Codex normally. Run `/exit` to return to the deck;
 the dashboard reconnects to the same app-server and refreshes the transcript.
+Sessions with large rollout files use a bounded 512 KiB tail preview instead of
+requesting the full transcript, so one oversized history cannot disconnect the
+dashboard.
 
 When Codex requests approval, reply with `y` (once), `a` (session), or `n`.
 When Codex asks several questions, separate answers with `|`.
@@ -64,8 +67,9 @@ When Codex asks several questions, separate answers with `|`.
 
 The dashboard shows sessions from all Codex clients by default and creates new
 threads with the `codex-deck` thread source. Use `--managed-only` when you want
-an isolated view. It does not inspect terminal processes, SQLite, or rollout
-JSONL files to infer runtime status.
+an isolated view. It does not inspect terminal processes or SQLite. A bounded
+rollout tail is used only for oversized transcript previews, never to infer
+runtime status.
 
 The detached app-server writes its PID, Unix socket, and log under
 `~/.codex-deck/`. The dashboard only owns its short-lived WebSocket connection;

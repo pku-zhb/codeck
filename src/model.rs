@@ -69,6 +69,7 @@ pub struct Session {
     pub title: String,
     pub preview: String,
     pub cwd: String,
+    pub path: Option<String>,
     pub updated_at: i64,
     pub source: String,
     pub thread_source: Option<String>,
@@ -99,6 +100,10 @@ impl Session {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let path = value
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         let updated_at = value
             .get("recencyAt")
             .or_else(|| value.get("updatedAt"))
@@ -116,6 +121,7 @@ impl Session {
             title,
             preview,
             cwd,
+            path,
             updated_at,
             source,
             thread_source,
