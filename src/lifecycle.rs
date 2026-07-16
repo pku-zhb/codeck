@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::state_dir;
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LifecycleData {
@@ -17,6 +17,8 @@ struct LifecycleData {
     initialized: bool,
     #[serde(default)]
     tracked_sessions: BTreeSet<String>,
+    #[serde(default)]
+    pinned_sessions: BTreeSet<String>,
 }
 
 pub struct LifecycleStore {
@@ -57,6 +59,10 @@ impl LifecycleStore {
         self.data.tracked_sessions.contains(thread_id)
     }
 
+    pub fn is_pinned(&self, thread_id: &str) -> bool {
+        self.data.pinned_sessions.contains(thread_id)
+    }
+
     pub fn track(&mut self, thread_id: impl Into<String>) {
         if self.data.tracked_sessions.insert(thread_id.into()) {
             self.dirty = true;
@@ -64,8 +70,22 @@ impl LifecycleStore {
     }
 
     pub fn dismiss(&mut self, thread_id: &str) {
-        if self.data.tracked_sessions.remove(thread_id) {
+        let removed_tracked = self.data.tracked_sessions.remove(thread_id);
+        let removed_pinned = self.data.pinned_sessions.remove(thread_id);
+        if removed_tracked || removed_pinned {
             self.dirty = true;
+        }
+    }
+
+    pub fn toggle_pin(&mut self, thread_id: &str) -> bool {
+        if self.data.pinned_sessions.remove(thread_id) {
+            self.dirty = true;
+            false
+        } else {
+            self.data.pinned_sessions.insert(thread_id.to_string());
+            self.data.tracked_sessions.insert(thread_id.to_string());
+            self.dirty = true;
+            true
         }
     }
 
@@ -78,7 +98,12 @@ impl LifecycleStore {
         self.data
             .tracked_sessions
             .retain(|thread_id| seen.contains(thread_id));
-        self.dirty |= before != self.data.tracked_sessions.len();
+        let pinned_before = self.data.pinned_sessions.len();
+        self.data
+            .pinned_sessions
+            .retain(|thread_id| seen.contains(thread_id));
+        self.dirty |= before != self.data.tracked_sessions.len()
+            || pinned_before != self.data.pinned_sessions.len();
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -132,17 +157,20 @@ mod tests {
         let mut store = LifecycleStore::load(path.clone()).expect("load empty state");
         assert!(!store.is_initialized());
         store.track("active-thread");
+        assert!(store.toggle_pin("active-thread"));
         store.finish_initial_scan(&BTreeSet::from(["active-thread".to_string()]));
         store.save().expect("save state");
 
         let mut restored = LifecycleStore::load(path.clone()).expect("restore state");
         assert!(restored.is_initialized());
         assert!(restored.contains("active-thread"));
+        assert!(restored.is_pinned("active-thread"));
         restored.dismiss("active-thread");
         restored.save().expect("save dismissal");
 
         let restored = LifecycleStore::load(path.clone()).expect("restore dismissal");
         assert!(!restored.contains("active-thread"));
+        assert!(!restored.is_pinned("active-thread"));
         fs::remove_file(path).expect("remove state");
     }
 }

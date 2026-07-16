@@ -170,6 +170,7 @@ impl Session {
 pub enum ComposeTarget {
     NewTask,
     Reply,
+    Rename,
 }
 
 #[derive(Debug, Clone)]

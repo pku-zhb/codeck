@@ -23,6 +23,8 @@ enum PendingCall {
     ThreadResumeForReply { thread_id: String, prompt: String },
     TurnStart { thread_id: String },
     TurnSteer { thread_id: String },
+    TurnInterrupt { thread_id: String },
+    ThreadNameSet { thread_id: String, name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +85,8 @@ pub struct App {
     scroll_back: usize,
     message_view_height: usize,
     attach_requested: Option<AttachRequest>,
+    rename_previous: Option<Composer>,
+    rename_thread_id: Option<String>,
 }
 
 impl App {
@@ -116,6 +120,8 @@ impl App {
             scroll_back: 0,
             message_view_height: 1,
             attach_requested: None,
+            rename_previous: None,
+            rename_thread_id: None,
         }
     }
 
@@ -177,15 +183,13 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
+                    self.cancel_rename();
                     self.composer.target = ComposeTarget::NewTask;
                     self.notice = "New task".to_string();
                     return Ok(());
                 }
                 KeyCode::Char('r') => {
-                    if !self.sessions.is_empty() {
-                        self.composer.target = ComposeTarget::Reply;
-                        self.notice = "Reply to selected session".to_string();
-                    }
+                    self.start_rename();
                     return Ok(());
                 }
                 KeyCode::Char('u') => {
@@ -193,8 +197,12 @@ impl App {
                     self.composer.cursor = 0;
                     return Ok(());
                 }
-                KeyCode::Char('d') => {
-                    self.dismiss_selected(sender)?;
+                KeyCode::Char('t') => {
+                    self.toggle_pin_selected()?;
+                    return Ok(());
+                }
+                KeyCode::Char('x') => {
+                    self.stop_or_remove_selected(sender)?;
                     return Ok(());
                 }
                 _ => {}
@@ -218,13 +226,20 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert("\n")
             }
+            KeyCode::Enter if self.composer.target == ComposeTarget::Rename => {
+                self.submit(sender)?
+            }
             KeyCode::Enter if self.composer.text.is_empty() => self.request_attach()?,
             KeyCode::Enter => self.submit(sender)?,
             KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Delete if self.composer.text.is_empty() => self.dismiss_selected(sender)?,
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Left => self.composer.move_left(),
-            KeyCode::Right if self.composer.text.is_empty() => self.request_attach()?,
+            KeyCode::Right
+                if self.composer.text.is_empty()
+                    && self.composer.target != ComposeTarget::Rename =>
+            {
+                self.request_attach()?
+            }
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Home => self.composer.cursor = 0,
             KeyCode::End => self.composer.cursor = self.composer.text.len(),
@@ -344,6 +359,9 @@ impl App {
             if matches!(call, PendingCall::ThreadList { .. }) {
                 self.list_inflight = false;
             }
+            if matches!(&call, PendingCall::ThreadNameSet { .. }) {
+                self.cancel_rename();
+            }
             self.notice = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -446,6 +464,20 @@ impl App {
             PendingCall::TurnSteer { thread_id } => {
                 self.notice = format!("Sent follow-up to {}", self.session_title(&thread_id));
             }
+            PendingCall::TurnInterrupt { thread_id } => {
+                self.notice = format!(
+                    "Stopping {} · press Ctrl+X again after it completes to remove it",
+                    self.session_title(&thread_id)
+                );
+            }
+            PendingCall::ThreadNameSet { thread_id, name } => {
+                if let Some(session) = self.session_mut(&thread_id) {
+                    session.title = name.clone();
+                }
+                self.cancel_rename();
+                self.notice = format!("Renamed session to {name}");
+                self.sort_sessions_preserving_selection();
+            }
         }
         Ok(())
     }
@@ -483,10 +515,14 @@ impl App {
             "thread/name/updated" => {
                 if let (Some(thread_id), Some(name)) = (
                     params.get("threadId").and_then(Value::as_str),
-                    params.get("name").and_then(Value::as_str),
+                    params
+                        .get("threadName")
+                        .or_else(|| params.get("name"))
+                        .and_then(Value::as_str),
                 ) && let Some(session) = self.session_mut(thread_id)
                 {
                     session.title = name.to_string();
+                    self.sort_sessions_preserving_selection();
                 }
             }
             "thread/deleted" | "thread/archived" => {
@@ -740,6 +776,25 @@ impl App {
                     );
                     self.notice = "Resuming session…".to_string();
                 }
+            }
+            ComposeTarget::Rename => {
+                let Some(thread_id) = self.rename_thread_id.clone() else {
+                    self.cancel_rename();
+                    self.notice = "Rename target is no longer available".to_string();
+                    return Ok(());
+                };
+                let id = sender.request(
+                    "thread/name/set",
+                    json!({ "threadId": thread_id, "name": text }),
+                )?;
+                self.pending_calls.insert(
+                    id,
+                    PendingCall::ThreadNameSet {
+                        thread_id,
+                        name: text,
+                    },
+                );
+                self.notice = "Renaming session…".to_string();
             }
         }
         Ok(())
@@ -1135,11 +1190,43 @@ impl App {
     }
 
     fn toggle_compose_target(&mut self) {
+        if self.composer.target == ComposeTarget::Rename {
+            self.cancel_rename();
+            self.notice = "Rename cancelled".to_string();
+            return;
+        }
         self.composer.target = match self.composer.target {
             ComposeTarget::NewTask if !self.sessions.is_empty() => ComposeTarget::Reply,
             ComposeTarget::NewTask => ComposeTarget::NewTask,
             ComposeTarget::Reply => ComposeTarget::NewTask,
+            ComposeTarget::Rename => unreachable!("rename handled above"),
         };
+    }
+
+    fn start_rename(&mut self) {
+        let Some(session) = self.selected_session() else {
+            self.notice = "No session selected".to_string();
+            return;
+        };
+        let thread_id = session.id.clone();
+        let title = session.title.clone();
+        if self.composer.target != ComposeTarget::Rename {
+            self.rename_previous = Some(self.composer.clone());
+        }
+        self.rename_thread_id = Some(thread_id);
+        self.composer.target = ComposeTarget::Rename;
+        self.composer.text = title;
+        self.composer.cursor = self.composer.text.len();
+        self.notice = "Edit the name and press Enter · Tab cancels".to_string();
+    }
+
+    fn cancel_rename(&mut self) {
+        if let Some(previous) = self.rename_previous.take() {
+            self.composer = previous;
+        } else if self.composer.target == ComposeTarget::Rename {
+            self.composer = Composer::default();
+        }
+        self.rename_thread_id = None;
     }
 
     fn should_track(&self, session: &Session) -> bool {
@@ -1161,9 +1248,28 @@ impl App {
         self.lifecycle.save().context("save session lifecycle")
     }
 
-    fn dismiss_selected(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+    fn toggle_pin_selected(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session() else {
+            self.notice = "No session selected".to_string();
+            return Ok(());
+        };
+        let thread_id = session.id.clone();
+        let title = session.title.clone();
+        let pinned = self.lifecycle.toggle_pin(&thread_id);
+        self.lifecycle.save().context("save session lifecycle")?;
+        self.sort_sessions_preserving_selection();
+        self.select_session(&thread_id);
+        self.notice = if pinned {
+            format!("Pinned {title}")
+        } else {
+            format!("Unpinned {title}")
+        };
+        Ok(())
+    }
+
+    fn stop_or_remove_selected(&mut self, sender: &mut impl RpcSender) -> Result<()> {
         if self.show_all {
-            self.notice = "Dismiss is available in the lifecycle view, without --all".to_string();
+            self.notice = "Remove is available in the lifecycle view, without --all".to_string();
             return Ok(());
         }
         let Some(session) = self.selected_session() else {
@@ -1171,7 +1277,19 @@ impl App {
             return Ok(());
         };
         if session.status.is_live() {
-            self.notice = "Active sessions stay in the deck until they finish".to_string();
+            let Some(turn_id) = session.active_turn_id.clone() else {
+                self.notice = "Loading the active turn before stopping it…".to_string();
+                self.ensure_selected_history(sender)?;
+                return Ok(());
+            };
+            let thread_id = session.id.clone();
+            let id = sender.request(
+                "turn/interrupt",
+                json!({ "threadId": thread_id, "turnId": turn_id }),
+            )?;
+            self.pending_calls
+                .insert(id, PendingCall::TurnInterrupt { thread_id });
+            self.notice = "Stopping session…".to_string();
             return Ok(());
         }
         let thread_id = session.id.clone();
@@ -1187,13 +1305,22 @@ impl App {
     }
 
     fn session_summary(&self) -> String {
-        let active = self
+        let pinned = self
             .sessions
             .iter()
-            .filter(|session| session.status.is_live())
+            .filter(|session| self.lifecycle.is_pinned(&session.id))
             .count();
-        let completed = self.sessions.len().saturating_sub(active);
-        format!("{active} active · {completed} completed")
+        let working = self
+            .sessions
+            .iter()
+            .filter(|session| !self.lifecycle.is_pinned(&session.id) && session.status.is_live())
+            .count();
+        let completed = self.sessions.len().saturating_sub(pinned + working);
+        format!("{pinned} pinned · {working} working · {completed} completed")
+    }
+
+    pub fn is_pinned(&self, thread_id: &str) -> bool {
+        self.lifecycle.is_pinned(thread_id)
     }
 
     fn session(&self, thread_id: &str) -> Option<&Session> {
@@ -1223,10 +1350,25 @@ impl App {
     }
 
     fn sort_sessions(&mut self) {
+        let lifecycle = &self.lifecycle;
         self.sessions.sort_by(|left, right| {
-            left.status
-                .sort_rank()
-                .cmp(&right.status.sort_rank())
+            let left_group = if lifecycle.is_pinned(&left.id) {
+                0
+            } else if left.status.is_live() {
+                1
+            } else {
+                2
+            };
+            let right_group = if lifecycle.is_pinned(&right.id) {
+                0
+            } else if right.status.is_live() {
+                1
+            } else {
+                2
+            };
+            left_group
+                .cmp(&right_group)
+                .then_with(|| left.status.sort_rank().cmp(&right.status.sort_rank()))
                 .then_with(|| right.updated_at.cmp(&left.updated_at))
                 .then_with(|| left.title.cmp(&right.title))
         });
@@ -1547,11 +1689,13 @@ mod tests {
 
     struct TestSender {
         next_id: u64,
+        requests: Vec<(String, Value)>,
     }
 
     impl RpcSender for TestSender {
-        fn request(&mut self, _method: &str, _params: Value) -> Result<u64> {
+        fn request(&mut self, method: &str, params: Value) -> Result<u64> {
             self.next_id += 1;
+            self.requests.push((method.to_string(), params));
             Ok(self.next_id)
         }
 
@@ -1580,6 +1724,30 @@ mod tests {
             App::with_lifecycle(PathBuf::from("/tmp"), show_all, lifecycle),
             path,
         )
+    }
+
+    fn test_sender() -> TestSender {
+        TestSender {
+            next_id: 0,
+            requests: Vec::new(),
+        }
+    }
+
+    fn test_session(id: &str, title: &str, status: SessionStatus) -> Session {
+        Session {
+            id: id.to_string(),
+            title: title.to_string(),
+            preview: String::new(),
+            cwd: format!("/tmp/{id}"),
+            path: None,
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some(THREAD_SOURCE.to_string()),
+            status,
+            active_turn_id: None,
+            messages: Vec::new(),
+            history_loaded: true,
+        }
     }
 
     #[test]
@@ -1694,13 +1862,114 @@ mod tests {
         app.lifecycle.track(session.id.clone());
         app.sessions.push(session);
         app.sessions[0].status = SessionStatus::Completed;
-        let mut sender = TestSender { next_id: 0 };
+        let mut sender = test_sender();
 
-        app.dismiss_selected(&mut sender).expect("dismiss session");
+        app.stop_or_remove_selected(&mut sender)
+            .expect("remove session");
 
         assert!(app.sessions.is_empty());
         assert!(!app.lifecycle.contains("review-thread"));
         assert!(app.notice.contains("Codex history was kept"));
         std::fs::remove_file(state_path).expect("remove lifecycle state");
+    }
+
+    #[test]
+    fn pin_persists_and_moves_session_into_the_first_group() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "working-thread",
+            "Working",
+            SessionStatus::Working,
+        ));
+        app.sessions.push(test_session(
+            "completed-thread",
+            "Completed",
+            SessionStatus::Completed,
+        ));
+        app.selected = 1;
+
+        app.toggle_pin_selected().expect("pin session");
+
+        assert_eq!(app.sessions[0].id, "completed-thread");
+        assert!(app.lifecycle.is_pinned("completed-thread"));
+        let restored = LifecycleStore::for_test(state_path.clone());
+        assert!(restored.is_pinned("completed-thread"));
+        std::fs::remove_file(state_path).expect("remove lifecycle state");
+    }
+
+    #[test]
+    fn rename_uses_the_official_thread_name_rpc_and_restores_the_composer() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "rename-thread",
+            "Old name",
+            SessionStatus::Completed,
+        ));
+        app.composer.target = ComposeTarget::Reply;
+        app.composer.text = "saved draft".to_string();
+        app.composer.cursor = app.composer.text.len();
+        app.start_rename();
+        app.composer.text = "New name".to_string();
+        app.composer.cursor = app.composer.text.len();
+        let mut sender = test_sender();
+
+        app.submit(&mut sender).expect("submit rename");
+
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "thread/name/set".to_string(),
+                json!({"threadId":"rename-thread","name":"New name"})
+            ))
+        );
+        app.handle_response(json!({"id": 1, "result": {}}), &mut sender)
+            .expect("handle rename response");
+        assert_eq!(app.sessions[0].title, "New name");
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert_eq!(app.composer.text, "saved draft");
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_x_interrupts_a_working_turn_without_removing_the_session() {
+        let (mut app, state_path) = test_app(false);
+        let mut session = test_session("working-thread", "Working", SessionStatus::Working);
+        session.active_turn_id = Some("turn-1".to_string());
+        app.sessions.push(session);
+        let mut sender = test_sender();
+
+        app.stop_or_remove_selected(&mut sender)
+            .expect("interrupt session");
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(
+            sender.requests.last(),
+            Some(&(
+                "turn/interrupt".to_string(),
+                json!({"threadId":"working-thread","turnId":"turn-1"})
+            ))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn official_thread_name_notification_updates_the_title() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "rename-thread",
+            "Old name",
+            SessionStatus::Completed,
+        ));
+        let mut sender = test_sender();
+
+        app.handle_notification(
+            "thread/name/updated",
+            json!({"threadId":"rename-thread","threadName":"Server name"}),
+            &mut sender,
+        )
+        .expect("handle name notification");
+
+        assert_eq!(app.sessions[0].title, "Server name");
+        let _ = std::fs::remove_file(state_path);
     }
 }

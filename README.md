@@ -32,7 +32,9 @@ codex-deck -C /path/to/project
 By default, the deck is a managed lifecycle rather than a history browser. It
 automatically adopts sessions started by the deck and currently active sessions
 from other Codex clients. Completed sessions remain until you review and dismiss
-them. Browse every unarchived local Codex session explicitly with:
+them. The list is grouped as `Pinned`, `Working`, and `Completed`; pinned sessions
+stay in the first group regardless of their current runtime status. Browse every
+unarchived local Codex session explicitly with:
 
 ```bash
 codex-deck --all
@@ -51,11 +53,12 @@ codex-deck --check
   the composer is empty
 - `Tab`: switch the composer between a new task and a reply
 - `Ctrl+N`: compose a new task
-- `Ctrl+R`: reply to the selected session
+- `Ctrl+T`: pin or unpin the selected session
+- `Ctrl+R`: rename the selected session
+- `Ctrl+X`: stop a working session; remove a completed/failed session from the
+  deck while preserving its Codex history
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
-- `Delete` / `Ctrl+D`: remove a completed/failed session from the deck after
-  review; its Codex history is preserved
 - `Ctrl+C`: close the dashboard; running tasks continue
 
 While attached, use native Codex normally. Run `/exit` to return to the deck;
@@ -76,10 +79,10 @@ When Codex asks several questions, separate answers with `|`.
 ## Scope
 
 The lifecycle registry is stored in `~/.codex-deck/lifecycle.json`. It contains
-only tracked thread IDs. Dismissing a session updates this registry without
-deleting, archiving, or modifying the underlying Codex thread. A dismissed
-thread is automatically adopted again if it becomes active later. Use `--all`
-when you need the old full-history view.
+tracked and pinned thread IDs. Removing a session updates this registry without
+deleting, archiving, or modifying the underlying Codex thread. A removed thread
+is automatically adopted again if it becomes active later. Use `--all` when you
+need the old full-history view.
 
 The dashboard does not inspect terminal processes or SQLite. A bounded rollout
 tail is used only for oversized transcript previews, never to infer runtime

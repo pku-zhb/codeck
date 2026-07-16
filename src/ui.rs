@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .saturating_sub(input_height)
         .saturating_sub(separator_height.saturating_mul(2));
     let max_sessions = (available / 3).max(1);
-    let desired_sessions = app.sessions().len().max(1) as u16;
+    let desired_sessions = (app.sessions().len() + 3) as u16;
     let session_height = desired_sessions.min(max_sessions).min(available);
     let chunks = Layout::vertical([
         Constraint::Length(session_height),
@@ -58,33 +58,79 @@ fn render_sessions(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    if app.sessions().is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  No sessions · type a task and press Enter",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
+    let selected = app.selected_index();
+    let groups = [
+        (SessionGroup::Pinned, "Pinned", Color::Magenta),
+        (SessionGroup::Working, "Working", Color::Green),
+        (SessionGroup::Completed, "Completed", Color::Cyan),
+    ];
+    let mut rows = Vec::with_capacity(app.sessions().len() + groups.len());
+    for (group, label, color) in groups {
+        let count = app
+            .sessions()
+            .iter()
+            .filter(|session| session_group(app.is_pinned(&session.id), session.status) == group)
+            .count();
+        rows.push((
+            None,
+            Line::from(vec![
+                Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {count}"), Style::default().fg(Color::DarkGray)),
+            ]),
+        ));
+        rows.extend(
+            app.sessions()
+                .iter()
+                .enumerate()
+                .filter(|(_, session)| {
+                    session_group(app.is_pinned(&session.id), session.status) == group
+                })
+                .map(|(index, session)| {
+                    (
+                        Some(index),
+                        session_line(session, index == selected, area.width as usize),
+                    )
+                }),
         );
-        return;
     }
 
-    let selected = app.selected_index();
     let height = area.height as usize;
-    let offset = if selected >= height {
-        selected + 1 - height
+    let selected_row = rows
+        .iter()
+        .position(|(index, _)| *index == Some(selected))
+        .unwrap_or_default();
+    let offset = if selected_row >= height {
+        selected_row + 1 - height
     } else {
         0
     };
-    let lines = app
-        .sessions()
-        .iter()
-        .enumerate()
+    let lines = rows
+        .into_iter()
         .skip(offset)
         .take(height)
-        .map(|(index, session)| session_line(session, index == selected, area.width as usize))
+        .map(|(_, line)| line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionGroup {
+    Pinned,
+    Working,
+    Completed,
+}
+
+fn session_group(pinned: bool, status: SessionStatus) -> SessionGroup {
+    if pinned {
+        SessionGroup::Pinned
+    } else if status.is_live() {
+        SessionGroup::Working
+    } else {
+        SessionGroup::Completed
+    }
 }
 
 fn session_line(session: &crate::model::Session, selected: bool, width: usize) -> Line<'static> {
@@ -96,19 +142,17 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
         Style::default()
     };
     let marker = if selected { "› " } else { "  " };
-    let dot_style = match session.status {
-        SessionStatus::NeedsInput => Style::default().fg(Color::Yellow),
-        SessionStatus::Working => Style::default().fg(Color::Green),
-        SessionStatus::Completed => Style::default().fg(Color::Cyan),
-        SessionStatus::Failed => Style::default().fg(Color::Red),
-    };
     let title_style = if selected {
         row_style.add_modifier(Modifier::BOLD)
+    } else if session.status == SessionStatus::NeedsInput {
+        row_style.fg(Color::Yellow)
+    } else if session.status == SessionStatus::Failed {
+        row_style.fg(Color::Red)
     } else {
         row_style
     };
     let right = session.leaf_directory();
-    let prefix_width = UnicodeWidthStr::width(marker) + 2;
+    let prefix_width = UnicodeWidthStr::width(marker);
     let right_width = UnicodeWidthStr::width(right.as_str());
     let title_budget = width
         .saturating_sub(prefix_width)
@@ -120,7 +164,6 @@ fn session_line(session: &crate::model::Session, selected: bool, width: usize) -
 
     Line::from(vec![
         Span::styled(marker.to_string(), row_style),
-        Span::styled("● ", row_style.patch(dot_style)),
         Span::styled(title, title_style),
         Span::styled(spacer, row_style),
         Span::styled(
@@ -244,11 +287,13 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ComposeTarget::NewTask => "＋ new › ",
         ComposeTarget::Reply if pending => "？ answer › ",
         ComposeTarget::Reply => "↳ reply › ",
+        ComposeTarget::Rename => "✎ rename › ",
     };
     let prefix_style = match app.composer().target {
         ComposeTarget::NewTask => Style::default().fg(Color::Green),
         ComposeTarget::Reply if pending => Style::default().fg(Color::Yellow),
         ComposeTarget::Reply => Style::default().fg(Color::Cyan),
+        ComposeTarget::Rename => Style::default().fg(Color::Magenta),
     }
     .add_modifier(Modifier::BOLD);
     let display = format!("{}{}", prefix, app.composer().text);
@@ -287,7 +332,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn composer_hint(app: &App) -> String {
-    let base = "Enter/→ attach · Tab new/reply · ↑↓ select · Del reviewed · Ctrl+C close";
+    let base = "Enter/→ attach · ↑↓ select · Ctrl+T pin · Ctrl+R rename · Ctrl+X stop/remove · Ctrl+C close";
     if app.notice().is_empty() {
         base.to_string()
     } else {
@@ -401,6 +446,23 @@ mod tests {
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
         assert!(line.style.bg.is_none());
+        assert!(!line.spans.iter().any(|span| span.content.contains('●')));
+    }
+
+    #[test]
+    fn pinned_group_takes_precedence_over_runtime_status() {
+        assert_eq!(
+            session_group(true, SessionStatus::Completed),
+            SessionGroup::Pinned
+        );
+        assert_eq!(
+            session_group(false, SessionStatus::NeedsInput),
+            SessionGroup::Working
+        );
+        assert_eq!(
+            session_group(false, SessionStatus::Failed),
+            SessionGroup::Completed
+        );
     }
 
     #[test]
