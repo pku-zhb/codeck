@@ -17,7 +17,10 @@ use app::{App, AttachRequest};
 use clap::Parser;
 use client::CodexClient;
 use crossterm::cursor::Show;
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -96,8 +99,13 @@ fn run_tui(mut app: App, mut client: CodexClient) -> Result<()> {
     install_panic_restore_hook();
     enable_raw_mode().context("enable terminal raw mode")?;
     let mut output = stdout();
-    execute!(output, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter terminal screen")?;
+    execute!(
+        output,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .context("enter terminal screen")?;
 
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
@@ -140,6 +148,11 @@ fn run_event_loop(
             match event::read().context("read terminal event")? {
                 Event::Key(key) => app.handle_key(key, client)?,
                 Event::Paste(text) => app.insert_paste(&text),
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_preview(3),
+                    MouseEventKind::ScrollDown => app.scroll_preview(-3),
+                    _ => {}
+                },
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -177,7 +190,8 @@ fn reenter_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableMouseCapture
     )
     .context("re-enter terminal screen")?;
     force_full_redraw(terminal).context("redraw terminal after attach")?;
@@ -193,6 +207,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     disable_raw_mode().context("disable terminal raw mode")?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         Show
@@ -206,7 +221,13 @@ fn install_panic_restore_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            Show
+        );
         original(info);
     }));
 }

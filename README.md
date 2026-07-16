@@ -61,6 +61,8 @@ codex-deck --check
   deck while preserving its Codex history
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
+- Mouse wheel: scroll only the conversation preview; it never changes the
+  selected session in the picker
 - `Ctrl+C`: close the dashboard; running tasks continue
 
 Attached images are shown as an `🖼N` counter in the composer and are sent as

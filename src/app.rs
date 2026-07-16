@@ -415,6 +415,14 @@ impl App {
         self.scroll_back = value;
     }
 
+    pub fn scroll_preview(&mut self, lines: isize) {
+        if lines >= 0 {
+            self.scroll_back = self.scroll_back.saturating_add(lines as usize);
+        } else {
+            self.scroll_back = self.scroll_back.saturating_sub(lines.unsigned_abs());
+        }
+    }
+
     pub fn set_message_view_height(&mut self, value: usize) {
         self.message_view_height = value.max(1);
     }
@@ -2197,6 +2205,28 @@ mod tests {
 
         app.move_selection(-1, &mut sender).expect("select A");
         assert_eq!(app.composer.text, "reply for A");
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_changes_only_preview_offset() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-a",
+            "Session A",
+            SessionStatus::Completed,
+        ));
+        app.selected = 0;
+
+        app.scroll_preview(3);
+        assert_eq!(app.scroll_back, 3);
+        assert_eq!(app.selected, 0);
+        app.scroll_preview(-2);
+        assert_eq!(app.scroll_back, 1);
+        assert_eq!(app.selected, 0);
+        app.scroll_preview(-10);
+        assert_eq!(app.scroll_back, 0);
+        assert_eq!(app.selected, 0);
         let _ = std::fs::remove_file(state_path);
     }
 
