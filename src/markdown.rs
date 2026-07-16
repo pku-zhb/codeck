@@ -1,6 +1,6 @@
 use std::num::NonZeroU16;
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::Frame;
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Rect;
@@ -76,6 +76,7 @@ struct TableState {
     rows: Vec<TableRow>,
     current_row: Option<TableRow>,
     in_head: bool,
+    alignments: Vec<Alignment>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,9 +229,12 @@ impl MarkdownBuilder {
                     None,
                 );
             }
-            Tag::Table(_) => {
+            Tag::Table(alignments) => {
                 self.begin_block();
-                self.table = Some(TableState::default());
+                self.table = Some(TableState {
+                    alignments,
+                    ..TableState::default()
+                });
             }
             Tag::TableHead => {
                 if let Some(table) = &mut self.table {
@@ -505,159 +509,12 @@ pub fn render_markdown(text: &str, base_style: Style, width: usize) -> Vec<Style
         | Options::ENABLE_MATH
         | Options::ENABLE_WIKILINKS;
     let width = width.max(1);
-    let normalized = normalize_loose_pipe_tables(text);
     let mut builder = MarkdownBuilder::new(base_style, width);
-    for event in Parser::new_ext(&normalized, options) {
+    for event in Parser::new_ext(text, options) {
         builder.event(event);
     }
     let lines = wrap_lines(builder.finish(), width);
     highlight_field_labels(lines)
-}
-
-fn normalize_loose_pipe_tables(text: &str) -> String {
-    let source_lines = text.split('\n').collect::<Vec<_>>();
-    let mut output = Vec::new();
-    let mut index = 0;
-    let mut fence_marker: Option<&'static str> = None;
-
-    while index < source_lines.len() {
-        let line = source_lines[index];
-        if let Some(marker) = fence_marker {
-            output.push(line.to_string());
-            if is_fence_line(line, marker) {
-                fence_marker = None;
-            }
-            index += 1;
-            continue;
-        }
-        if let Some(marker) = fence_start_marker(line) {
-            output.push(line.to_string());
-            fence_marker = Some(marker);
-            index += 1;
-            continue;
-        }
-
-        let Some(cells) = loose_pipe_cells(line) else {
-            output.push(line.to_string());
-            index += 1;
-            continue;
-        };
-        let column_count = cells.len();
-        let mut end = index + 1;
-        while end < source_lines.len() {
-            let next = source_lines[end];
-            if fence_start_marker(next).is_some() {
-                break;
-            }
-            if is_table_delimiter_row(next, column_count) {
-                end += 1;
-                continue;
-            }
-            let Some(next_cells) = loose_pipe_cells(next) else {
-                break;
-            };
-            if next_cells.len() != column_count {
-                break;
-            }
-            end += 1;
-        }
-
-        let block = &source_lines[index..end];
-        if block.len() < 2 {
-            output.push(line.to_string());
-            index += 1;
-            continue;
-        }
-
-        if output
-            .last()
-            .is_some_and(|previous| !previous.trim().is_empty())
-        {
-            output.push(String::new());
-        }
-        output.push(line.to_string());
-        if block
-            .get(1)
-            .is_none_or(|row| !is_table_delimiter_row(row, column_count))
-        {
-            output.push(loose_table_delimiter(line, column_count));
-        }
-        for row in &block[1..] {
-            output.push((*row).to_string());
-        }
-        if end < source_lines.len() && !source_lines[end].trim().is_empty() {
-            output.push(String::new());
-        }
-        index = end;
-    }
-
-    output.join("\n")
-}
-
-fn fence_start_marker(line: &str) -> Option<&'static str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("```") {
-        Some("```")
-    } else if trimmed.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
-    }
-}
-
-fn is_fence_line(line: &str, marker: &str) -> bool {
-    line.trim_start().starts_with(marker)
-}
-
-fn loose_pipe_cells(line: &str) -> Option<Vec<&str>> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || is_table_delimiter_candidate(trimmed) {
-        return None;
-    }
-    let body = trimmed.trim_matches('|');
-    let cells = body.split('|').map(str::trim).collect::<Vec<_>>();
-    if cells.len() < 2 || cells.iter().all(|cell| cell.is_empty()) {
-        return None;
-    }
-    Some(cells)
-}
-
-fn is_table_delimiter_row(line: &str, column_count: usize) -> bool {
-    let trimmed = line.trim();
-    if !is_table_delimiter_candidate(trimmed) {
-        return false;
-    }
-    let cells = trimmed
-        .trim_matches('|')
-        .split('|')
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    cells.len() == column_count && cells.iter().all(|cell| is_alignment_cell(cell))
-}
-
-fn is_table_delimiter_candidate(line: &str) -> bool {
-    line.chars()
-        .all(|ch| matches!(ch, '|' | '-' | ':' | ' ' | '\t'))
-}
-
-fn is_alignment_cell(cell: &str) -> bool {
-    let trimmed = cell.trim();
-    let without_left = trimmed.strip_prefix(':').unwrap_or(trimmed);
-    let without_right = without_left.strip_suffix(':').unwrap_or(without_left);
-    without_right.len() >= 3 && without_right.chars().all(|ch| ch == '-')
-}
-
-fn loose_table_delimiter(header: &str, column_count: usize) -> String {
-    let delimiter = (0..column_count)
-        .map(|_| "---")
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let trimmed = header.trim();
-    if trimmed.starts_with('|') || trimmed.ends_with('|') {
-        format!("| {delimiter} |")
-    } else {
-        delimiter
-    }
 }
 
 pub fn apply_osc8_links(frame: &mut Frame<'_>, area: Rect, lines: &[StyledLine]) {
@@ -707,22 +564,107 @@ fn table_record_trigger_width(width: usize) -> usize {
 }
 
 fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
+    let column_count = table_column_count(table);
+    let column_widths = table_column_widths(table, column_count);
     table
         .rows
         .iter()
         .map(|row| {
             let mut line = StyledLine::default();
-            for (index, cell) in row.cells.iter().enumerate() {
+            for index in 0..column_count {
                 if index > 0 {
                     line.push(" │ ", Style::default().fg(Color::DarkGray), None);
                 }
-                for span in &cell.spans {
-                    line.push(span.text.clone(), span.style, span.link.clone());
+                let cell = row.cells.get(index);
+                let cell_width = cell.map(StyledLine::width).unwrap_or_default();
+                let padding = column_widths[index].saturating_sub(cell_width);
+                let alignment = table
+                    .alignments
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Alignment::None);
+                let (left_pad, right_pad) = table_cell_padding(alignment, padding);
+                push_spaces(&mut line, left_pad);
+                if let Some(cell) = cell {
+                    push_table_cell_spans(
+                        &mut line,
+                        cell,
+                        table_compact_cell_style(row, index),
+                        row.is_header || index == 0,
+                    );
                 }
+                push_spaces(&mut line, right_pad);
             }
             line
         })
         .collect()
+}
+
+fn table_column_count(table: &TableState) -> usize {
+    table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or_default()
+}
+
+fn table_column_widths(table: &TableState, column_count: usize) -> Vec<usize> {
+    let mut widths = vec![0; column_count];
+    for row in &table.rows {
+        for (index, cell) in row.cells.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.width());
+            }
+        }
+    }
+    widths
+}
+
+fn table_cell_padding(alignment: Alignment, padding: usize) -> (usize, usize) {
+    match alignment {
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - padding / 2),
+        Alignment::Left | Alignment::None => (0, padding),
+    }
+}
+
+fn table_compact_cell_style(row: &TableRow, index: usize) -> Style {
+    if row.is_header || index == 0 {
+        table_key_style()
+    } else {
+        table_value_style()
+    }
+}
+
+fn push_spaces(line: &mut StyledLine, count: usize) {
+    if count > 0 {
+        line.push(" ".repeat(count), Style::default(), None);
+    }
+}
+
+fn push_table_cell_spans(line: &mut StyledLine, cell: &StyledLine, overlay: Style, force_fg: bool) {
+    for span in &cell.spans {
+        let mut span_overlay = overlay;
+        if !force_fg && span.style.fg.is_some() {
+            span_overlay.fg = None;
+        }
+        line.push(
+            span.text.clone(),
+            span.style.patch(span_overlay),
+            span.link.clone(),
+        );
+    }
+}
+
+fn table_key_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn table_value_style() -> Style {
+    Style::default().fg(Color::Yellow)
 }
 
 fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
@@ -756,9 +698,7 @@ fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
                 None,
             );
             line.push(" ", Style::default(), None);
-            for span in &cell.spans {
-                line.push(span.text.clone(), span.style, span.link.clone());
-            }
+            push_table_cell_spans(&mut line, cell, table_value_style(), false);
             row_lines.push(line);
         }
         if row_lines.is_empty() {
@@ -1082,55 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_renders_loose_pipe_tables_as_field_records() {
-        let lines = render_markdown(
-            "关键假设来自 Arizona P1 官方 20k/月，以及 P1+P2 合计约 50k/月。\n\
-             口径 | Taiwan | U.S. | Japan\n\
-             N3 | 约 80% | 约 10-15% | 约 5-8%\n\
-             N2 及更先进，新增 $100bn 后 | 约 53-60% | 约 40-47% | 0\n\
-             所以倒推：",
-            Style::default(),
-            42,
-        );
-        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
-        let separators = rendered
-            .iter()
-            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
-            .collect::<Vec<_>>();
-
-        assert!(
-            rendered.iter().any(|line| line.starts_with("关键假设")),
-            "rendered={rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line == "口径: N3"),
-            "rendered={rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line == "U.S.: 约 10-15%"),
-            "rendered={rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line == "Japan: 0"),
-            "rendered={rendered:?}"
-        );
-        assert!(
-            rendered.iter().any(|line| line.starts_with("所以倒推")),
-            "rendered={rendered:?}"
-        );
-        assert_eq!(separators.len(), 3, "rendered={rendered:?}");
-        assert!(!rendered.iter().any(|line| line.contains("口径 │ Taiwan")));
-
-        let label = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|span| span.text == "口径:")
-            .expect("field label");
-        assert_eq!(label.style.fg, Some(Color::Cyan));
-        assert!(label.style.add_modifier.contains(Modifier::BOLD));
-    }
-
-    #[test]
     fn markdown_renders_readability_wide_tables_as_field_records() {
         let lines = render_markdown(
             "| 口径 | Taiwan | U.S. | Japan |\n\
@@ -1172,7 +1063,7 @@ mod tests {
         let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
 
         assert!(
-            rendered.iter().any(|line| line == "公司 │ 代码"),
+            rendered.iter().any(|line| line == "公司   │ 代码"),
             "rendered={rendered:?}"
         );
         assert!(
@@ -1180,6 +1071,68 @@ mod tests {
             "rendered={rendered:?}"
         );
         assert!(!rendered.iter().any(|line| line == "公司: 英伟达"));
+    }
+
+    #[test]
+    fn markdown_aligns_and_colors_compact_tables() {
+        let lines = render_markdown(
+            "| 项目 | 算法 | 结果 |\n\
+             |---|---|---:|\n\
+             | 单座先进 fab | 20-25k wpm | 20-25k |\n\
+             | 旧 AZ N2+ | 4 座 x 20-25k | 80-100k |",
+            Style::default(),
+            80,
+        );
+        let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        let table_lines = rendered
+            .iter()
+            .filter(|line| line.contains('│'))
+            .collect::<Vec<_>>();
+        let first_column_widths = table_lines
+            .iter()
+            .map(|line| UnicodeWidthStr::width(line.split('│').next().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        let result_column_widths = table_lines
+            .iter()
+            .map(|line| UnicodeWidthStr::width(line.rsplit('│').next().unwrap_or_default()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(table_lines.len(), 3, "rendered={rendered:?}");
+        assert!(
+            first_column_widths
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+        );
+        assert!(
+            result_column_widths
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+        );
+        assert!(!rendered.iter().any(|line| line.contains("项目:")));
+
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+        let header = spans
+            .iter()
+            .find(|span| span.text == "项目")
+            .expect("header");
+        assert_eq!(header.style.fg, Some(Color::Cyan));
+        assert!(header.style.add_modifier.contains(Modifier::BOLD));
+
+        let key = spans
+            .iter()
+            .find(|span| span.text == "旧 AZ N2+")
+            .expect("key");
+        assert_eq!(key.style.fg, Some(Color::Cyan));
+        assert!(key.style.add_modifier.contains(Modifier::BOLD));
+
+        let value = spans
+            .iter()
+            .find(|span| span.text == "80-100k")
+            .expect("value");
+        assert_eq!(value.style.fg, Some(Color::Yellow));
     }
 
     #[test]
