@@ -27,7 +27,7 @@ pub fn save_clipboard_image() -> Result<Option<PathBuf>> {
         .unwrap_or_default()
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "codex-deck-clipboard-{}-{timestamp}.png",
+        "codeck-clipboard-{}-{timestamp}.png",
         std::process::id()
     ));
     write_rgba_png(
@@ -101,10 +101,8 @@ mod tests {
 
     #[test]
     fn pasted_image_paths_are_detected_without_consuming_normal_text() {
-        let path = std::env::temp_dir().join(format!(
-            "codex-deck-pasted-image-{}.png",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codeck-pasted-image-{}.png", std::process::id()));
         write_rgba_png(&path, 1, 1, &[255, 0, 0, 255]).expect("write PNG fixture");
 
         assert_eq!(

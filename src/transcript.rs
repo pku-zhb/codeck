@@ -267,10 +267,8 @@ mod tests {
 
     #[test]
     fn small_rollouts_keep_using_the_official_history_api() {
-        let path = std::env::temp_dir().join(format!(
-            "codex-deck-small-transcript-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codeck-small-transcript-{}", std::process::id()));
         std::fs::write(&path, b"{}\n").expect("write fixture");
         let result = load_bounded_preview_if_large(&path).expect("inspect fixture");
         std::fs::remove_file(path).expect("remove fixture");
@@ -302,10 +300,8 @@ mod tests {
 
     #[test]
     fn oversized_rollout_reads_only_its_bounded_tail() {
-        let path = std::env::temp_dir().join(format!(
-            "codex-deck-large-transcript-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("codeck-large-transcript-{}", std::process::id()));
         let mut file = File::create(&path).expect("create fixture");
         file.set_len(FULL_HISTORY_LIMIT_BYTES + 1)
             .expect("make sparse fixture");

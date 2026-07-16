@@ -1,6 +1,6 @@
-# codex-deck
+# Codeck
 
-`codex-deck` is a keyboard-first terminal dashboard for background Codex
+`codeck` is a keyboard-first terminal dashboard for background Codex
 sessions. It runs the official Codex app-server behind a private Unix socket,
 so tasks keep running after the dashboard exits.
 
@@ -20,17 +20,17 @@ cargo install --path .
 Run from the directory new sessions should use:
 
 ```bash
-codex-deck
+codeck
 ```
 
 Use another working directory:
 
 ```bash
-codex-deck -C /path/to/project
+codeck -C /path/to/project
 ```
 
-By default, the deck is a managed lifecycle rather than a history browser. It
-automatically adopts sessions started by the deck and currently active sessions
+By default, Codeck is a managed lifecycle rather than a history browser. It
+automatically adopts sessions started by Codeck and currently active sessions
 from other Codex clients. Completed sessions remain until you review and dismiss
 them. Pinned sessions stay at the top and show a `📌` in a reserved left-hand
 slot; every row keeps that slot so status dots and titles remain aligned. The
@@ -38,13 +38,13 @@ remaining sessions are ordered by status and then most recent reply. Any
 session that is actively working shows a steady green dot; all other sessions
 leave the status-light slot empty. Selection uses foreground color only, without
 a leading marker, group headers, or background highlight. Historical
-sessions outside the Deck are available from the built-in `Resume` menu tab, so
+sessions outside Codeck are available from the built-in `Resume` menu tab, so
 resuming old work does not require leaving the dashboard or adding CLI flags.
 
 Check daemon connectivity without opening the TUI:
 
 ```bash
-codex-deck --check
+codeck --check
 ```
 
 ## Keys
@@ -53,7 +53,7 @@ codex-deck --check
 - `Left`, twice consecutively: open the menu on its default `Resume` tab when
   the composer is empty; use `Tab` to switch to `Settings`
 - In `Resume`: type to filter historical sessions, choose with `Up` / `Down`, and
-  press `Enter` to add one to the Deck; the composer switches to Reply so the
+  press `Enter` to add one to Codeck; the composer switches to Reply so the
   next message resumes it in the background
 - In `Settings`: choose preview verbosity with `Up` / `Down` and save with
   `Enter`
@@ -69,7 +69,7 @@ codex-deck --check
 - `Ctrl+T`: pin or unpin the selected session
 - `Ctrl+R`: rename the selected session
 - `Ctrl+X`, twice consecutively: pause a working session; remove a
-  completed/failed session from the deck while preserving its Codex history;
+  completed/failed session from Codeck while preserving its Codex history;
   holding the key does not confirm either action
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
@@ -94,7 +94,7 @@ working directory. Selected skills are sent as native structured `skill` input
 items in addition to their visible `$skill-name` prompt marker. Local skill
 changes invalidate the cached picker automatically.
 
-While attached, use native Codex normally. Run `/exit` to return to the deck;
+While attached, use native Codex normally. Run `/exit` to return to Codeck;
 the dashboard reconnects to the same app-server and refreshes the transcript.
 Sessions with large rollout files use a bounded 64 MiB tail preview instead of
 requesting the full transcript, so one oversized history cannot disconnect the
@@ -116,16 +116,18 @@ When Codex asks several questions, separate answers with `|`.
 
 ## Scope
 
-The lifecycle registry is stored in `~/.codex-deck/lifecycle.json`. It contains
-tracked and pinned thread IDs. Removing a session updates this registry without
-deleting, archiving, or modifying the underlying Codex thread. A removed thread
-is available immediately in the `Resume` tab and is automatically adopted again if
-it becomes active elsewhere later.
+The lifecycle registry is stored in `~/.codeck/lifecycle.json`. Existing
+installs continue using the legacy `~/.codex-deck/` directory when it is already
+present, so tracked sessions, pins, and a running app-server survive the rename.
+It contains tracked and pinned thread IDs. Removing a session updates this
+registry without deleting, archiving, or modifying the underlying Codex thread.
+A removed thread is available immediately in the `Resume` tab and is
+automatically adopted again if it becomes active elsewhere later.
 
 The dashboard does not inspect terminal processes or SQLite. A bounded rollout
 tail is used only for oversized transcript previews, never to infer runtime
 status.
 
-The detached app-server writes its PID, Unix socket, and log under
-`~/.codex-deck/`. The dashboard only owns its short-lived WebSocket connection;
-closing it does not stop the background server or active turns.
+The detached app-server writes its PID, Unix socket, and log under the active
+Codeck state directory. The dashboard only owns its short-lived WebSocket
+connection; closing it does not stop the background server or active turns.

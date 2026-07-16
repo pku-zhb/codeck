@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn lifecycle_state_persists_tracking_and_dismissal() {
         let path = std::env::temp_dir().join(format!(
-            "codex-deck-lifecycle-{}-{}.json",
+            "codeck-lifecycle-{}-{}.json",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));

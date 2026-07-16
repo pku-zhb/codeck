@@ -266,8 +266,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-deck"
-version = "0.11.4"
+name = "codeck"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arboard",

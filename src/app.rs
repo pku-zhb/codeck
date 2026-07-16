@@ -16,7 +16,8 @@ use crate::model::{
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const THREAD_SOURCE: &str = "codex-deck";
+const THREAD_SOURCE: &str = "codeck";
+const LEGACY_THREAD_SOURCE: &str = "codex-deck";
 
 #[derive(Debug)]
 enum PendingCall {
@@ -246,8 +247,8 @@ impl App {
             "initialize",
             json!({
                 "clientInfo": {
-                    "name": "codex_deck",
-                    "title": "Codex Deck",
+                    "name": "codeck",
+                    "title": "Codeck",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -893,7 +894,7 @@ impl App {
             .to_string();
 
         if thread_id.is_empty() {
-            sender.respond_error(id, -32601, "codex-deck cannot route this request")?;
+            sender.respond_error(id, -32601, "codeck cannot route this request")?;
             self.notice = format!("Unsupported app-server request: {method}");
             return Ok(());
         }
@@ -1112,7 +1113,7 @@ impl App {
                     "thread/start",
                     json!({
                         "cwd": self.cwd.to_string_lossy(),
-                        "serviceName": "codex-deck",
+                        "serviceName": "codeck",
                         "threadSource": THREAD_SOURCE,
                         "ephemeral": false
                     }),
@@ -1259,14 +1260,14 @@ impl App {
             PendingRequestKind::PermissionApproval => {
                 json!({ "permissions": {}, "scope": "turn" })
             }
-            // MCP form replies depend on the requested JSON schema. Until the deck has
+            // MCP form replies depend on the requested JSON schema. Until Codeck has
             // a real form renderer, declining is safer than fabricating invalid content.
             PendingRequestKind::McpElicitation => json!({ "action": "decline" }),
             PendingRequestKind::Unsupported(method) => {
                 sender.respond_error(
                     request.id,
                     -32601,
-                    &format!("codex-deck does not support {method}"),
+                    &format!("codeck does not support {method}"),
                 )?;
                 self.notice = format!("Rejected unsupported request: {method}");
                 return Ok(());
@@ -1838,7 +1839,7 @@ impl App {
             KeyCode::Enter => {
                 self.lifecycle
                     .set_preview_verbosity(self.settings_selection);
-                self.lifecycle.save().context("save deck settings")?;
+                self.lifecycle.save().context("save Codeck settings")?;
                 self.settings_open = false;
                 self.settings_left_armed = false;
                 self.history_picker = None;
@@ -2026,7 +2027,10 @@ impl App {
         self.lifecycle.contains(&session.id)
             || session.status.is_live()
             || (!self.lifecycle.is_initialized()
-                && session.thread_source.as_deref() == Some(THREAD_SOURCE))
+                && matches!(
+                    session.thread_source.as_deref(),
+                    Some(THREAD_SOURCE | LEGACY_THREAD_SOURCE)
+                ))
     }
 
     fn track_session(&mut self, thread_id: &str) -> Result<()> {
@@ -2094,7 +2098,7 @@ impl App {
         self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         self.discard_reply_draft(&thread_id, was_selected);
         self.scroll_back = 0;
-        self.notice = "Reviewed session removed from the deck; Codex history was kept".to_string();
+        self.notice = "Reviewed session removed from Codeck; Codex history was kept".to_string();
         self.ensure_selected_history(sender)
     }
 
@@ -2134,7 +2138,7 @@ impl App {
         self.notice = match action {
             CtrlXAction::Pause => format!("Press Ctrl+X again to pause {title}"),
             CtrlXAction::Remove => format!(
-                "Press Ctrl+X again to remove {title} from the deck · Codex history will be kept"
+                "Press Ctrl+X again to remove {title} from Codeck · Codex history will be kept"
             ),
         };
         Ok(())
@@ -2725,7 +2729,7 @@ mod tests {
     fn test_app(show_all: bool) -> (App, PathBuf) {
         let sequence = NEXT_TEST_STATE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "codex-deck-app-lifecycle-{}-{sequence}.json",
+            "codeck-app-lifecycle-{}-{sequence}.json",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -2930,7 +2934,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_menu_adds_a_history_session_then_resumes_it_in_the_deck() {
+    fn resume_menu_adds_a_history_session_then_resumes_it_in_codeck() {
         let (mut app, state_path) = test_app(false);
         app.merge_history_session(test_session(
             "history-thread",
@@ -2981,7 +2985,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut sender,
         )
-        .expect("resume inside deck");
+        .expect("resume inside Codeck");
         assert_eq!(
             sender.requests.last(),
             Some(&(
@@ -3263,7 +3267,27 @@ mod tests {
     }
 
     #[test]
-    fn completed_session_waits_for_review_then_leaves_only_the_deck() {
+    fn initial_lifecycle_adopts_sessions_created_by_legacy_name() {
+        let (mut app, state_path) = test_app(false);
+        app.merge_thread_list(&json!({
+            "data": [{
+                "id": "legacy-thread",
+                "preview": "Pre-rename session",
+                "cwd": "/tmp/legacy",
+                "status": {"type": "idle"},
+                "source": "appServer",
+                "threadSource": LEGACY_THREAD_SOURCE
+            }]
+        }));
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, "legacy-thread");
+        assert!(app.lifecycle.contains("legacy-thread"));
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn completed_session_waits_for_review_then_leaves_only_codeck() {
         let (mut app, state_path) = test_app(false);
         let session = Session::from_thread(&json!({
             "id": "review-thread",
@@ -3271,7 +3295,7 @@ mod tests {
             "cwd": "/tmp/review",
             "status": {"type": "active", "activeFlags": []},
             "source": "appServer",
-            "threadSource": "codex-deck"
+            "threadSource": THREAD_SOURCE
         }))
         .expect("session");
         app.lifecycle.track(session.id.clone());

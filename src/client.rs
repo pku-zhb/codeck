@@ -236,7 +236,7 @@ fn ensure_app_server() -> Result<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(errors));
-    // The app-server must survive both codex-deck and its launching terminal.
+    // The app-server must survive both Codeck and its launching terminal.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -277,7 +277,17 @@ fn ensure_app_server() -> Result<PathBuf> {
 
 pub(crate) fn state_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".codex-deck"))
+    Ok(state_dir_for_home(&PathBuf::from(home)))
+}
+
+fn state_dir_for_home(home: &Path) -> PathBuf {
+    let current = home.join(".codeck");
+    let legacy = home.join(".codex-deck");
+    if current.exists() || !legacy.exists() {
+        current
+    } else {
+        legacy
+    }
 }
 
 fn process_from_state_is_alive() -> Result<bool> {
@@ -303,5 +313,29 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove stale {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_directory_prefers_current_name_but_falls_back_to_legacy_install() {
+        let home = std::env::temp_dir().join(format!(
+            "codeck-state-home-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create test home");
+
+        assert_eq!(state_dir_for_home(&home), home.join(".codeck"));
+        fs::create_dir(home.join(".codex-deck")).expect("create legacy state");
+        assert_eq!(state_dir_for_home(&home), home.join(".codex-deck"));
+        fs::create_dir(home.join(".codeck")).expect("create current state");
+        assert_eq!(state_dir_for_home(&home), home.join(".codeck"));
+
+        fs::remove_dir_all(home).expect("remove test home");
     }
 }

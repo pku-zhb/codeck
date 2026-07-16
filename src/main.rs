@@ -30,7 +30,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
 
 #[derive(Debug, Parser)]
-#[command(name = "codex-deck", version, about)]
+#[command(name = "codeck", version, about)]
 struct Args {
     /// Working directory used for newly dispatched sessions.
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
@@ -84,7 +84,7 @@ fn run_check(mut app: App, mut client: CodexClient) -> Result<()> {
         }
         if app.initial_load_complete() {
             println!(
-                "codex-deck: connected · {} session{}",
+                "codeck: connected · {} session{}",
                 app.sessions().len(),
                 if app.sessions().len() == 1 { "" } else { "s" }
             );
@@ -243,12 +243,12 @@ mod tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn attach_uses_native_tui_on_the_deck_app_server() {
+    fn attach_uses_native_tui_on_the_codeck_app_server() {
         let request = AttachRequest {
             thread_id: "thread-123".to_string(),
             cwd: PathBuf::from("/tmp"),
         };
-        let command = attached_codex_command(&request, "unix:///tmp/deck.sock");
+        let command = attached_codex_command(&request, "unix:///tmp/codeck.sock");
         let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(
             args,
@@ -256,7 +256,7 @@ mod tests {
                 OsStr::new("resume"),
                 OsStr::new("--include-non-interactive"),
                 OsStr::new("--remote"),
-                OsStr::new("unix:///tmp/deck.sock"),
+                OsStr::new("unix:///tmp/codeck.sock"),
                 OsStr::new("thread-123"),
             ]
         );
@@ -270,7 +270,7 @@ mod tests {
     fn attach_return_forces_identical_content_to_be_redrawn() {
         let mut terminal = Terminal::new(TestBackend::new(12, 2)).expect("terminal");
         terminal
-            .draw(|frame| frame.render_widget(Paragraph::new("deck"), frame.area()))
+            .draw(|frame| frame.render_widget(Paragraph::new("codeck"), frame.area()))
             .expect("first draw");
         terminal.backend_mut().clear().expect("simulate new screen");
         terminal
@@ -279,10 +279,10 @@ mod tests {
 
         force_full_redraw(&mut terminal).expect("invalidate buffers");
         terminal
-            .draw(|frame| frame.render_widget(Paragraph::new("deck"), frame.area()))
+            .draw(|frame| frame.render_widget(Paragraph::new("codeck"), frame.area()))
             .expect("redraw");
         terminal
             .backend()
-            .assert_buffer_lines(["deck        ", "            "]);
+            .assert_buffer_lines(["codeck      ", "            "]);
     }
 }

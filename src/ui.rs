@@ -153,10 +153,7 @@ fn menu_tabs(selected: MenuTab) -> Line<'static> {
         .add_modifier(Modifier::BOLD);
     let inactive = Style::default().fg(Color::DarkGray);
     Line::from(vec![
-        Span::styled(
-            "Codex Deck  ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Codeck  ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             "Resume",
             if selected == MenuTab::Resume {
@@ -232,7 +229,7 @@ fn render_settings_tab(
         lines.push(Line::default());
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ select · Enter save · Tab switch · ←← close · Ctrl+C close Deck",
+        "↑↓ select · Enter save · Tab switch · ←← close · Ctrl+C close Codeck",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(Text::from(lines.clone())), panel);
@@ -269,7 +266,7 @@ fn render_resume_tab(
     if items.is_empty() {
         lines.push(Line::from(Span::styled(
             if query.is_empty() {
-                "  No sessions outside the Deck"
+                "  No sessions outside Codeck"
             } else {
                 "  No matching sessions"
             },
@@ -422,7 +419,7 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             app.preview_verbosity(),
         ),
         None => vec![StyledLine::from_span(
-            "  New tasks will appear here and keep running after you close the deck.",
+            "  New tasks will appear here and keep running after you close Codeck.",
             dim_style(),
         )],
     };
@@ -802,7 +799,7 @@ mod tests {
             path: None,
             updated_at: 0,
             source: "appServer".to_string(),
-            thread_source: Some("codex-deck".to_string()),
+            thread_source: Some("codeck".to_string()),
             status: SessionStatus::Working,
             active_turn_id: None,
             messages: Vec::new(),
@@ -841,7 +838,7 @@ mod tests {
                 path: None,
                 updated_at: 0,
                 source: "appServer".to_string(),
-                thread_source: Some("codex-deck".to_string()),
+                thread_source: Some("codeck".to_string()),
                 status,
                 active_turn_id: None,
                 messages: Vec::new(),
@@ -867,7 +864,7 @@ mod tests {
             path: None,
             updated_at: 0,
             source: "appServer".to_string(),
-            thread_source: Some("codex-deck".to_string()),
+            thread_source: Some("codeck".to_string()),
             status: SessionStatus::Completed,
             active_turn_id: None,
             messages: Vec::new(),
