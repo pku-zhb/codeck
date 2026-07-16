@@ -5,10 +5,11 @@ mod ui;
 
 use std::io::{self, stdout};
 use std::path::PathBuf;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use app::App;
+use app::{App, AttachRequest};
 use clap::Parser;
 use client::CodexClient;
 use crossterm::cursor::Show;
@@ -113,6 +114,18 @@ fn run_event_loop(
             needs_draw = true;
         }
         app.tick(client)?;
+
+        if let Some(request) = app.take_attach_request() {
+            let endpoint = client.endpoint().to_string();
+            let status = run_attached_codex(terminal, &request, &endpoint)?;
+            app.refresh_after_attach(&request.thread_id, client)?;
+            if !status.success() {
+                app.set_notice(format!("Attached Codex exited with {status}"));
+            }
+            needs_draw = true;
+            continue;
+        }
+
         if needs_draw {
             terminal.draw(|frame| ui::render(frame, app))?;
             needs_draw = false;
@@ -128,6 +141,43 @@ fn run_event_loop(
             needs_draw = true;
         }
     }
+    Ok(())
+}
+
+fn run_attached_codex(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    request: &AttachRequest,
+    endpoint: &str,
+) -> Result<ExitStatus> {
+    restore_terminal(terminal)?;
+    let mut command = attached_codex_command(request, endpoint);
+    let status = command.status().context("attach native Codex session");
+    reenter_terminal(terminal)?;
+    status
+}
+
+fn attached_codex_command(request: &AttachRequest, endpoint: &str) -> Command {
+    let mut command = Command::new("codex");
+    command
+        .args(["resume", "--include-non-interactive", "--remote", endpoint])
+        .arg(&request.thread_id);
+    if request.cwd.is_dir() {
+        command.current_dir(&request.cwd);
+    }
+    command
+}
+
+fn reenter_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    enable_raw_mode().context("re-enable terminal raw mode")?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    )
+    .context("re-enter terminal screen")?;
+    terminal
+        .autoresize()
+        .context("resize terminal after attach")?;
     Ok(())
 }
 
@@ -151,4 +201,34 @@ fn install_panic_restore_hook() {
         let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn attach_uses_native_tui_on_the_deck_app_server() {
+        let request = AttachRequest {
+            thread_id: "thread-123".to_string(),
+            cwd: PathBuf::from("/tmp"),
+        };
+        let command = attached_codex_command(&request, "unix:///tmp/deck.sock");
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                OsStr::new("resume"),
+                OsStr::new("--include-non-interactive"),
+                OsStr::new("--remote"),
+                OsStr::new("unix:///tmp/deck.sock"),
+                OsStr::new("thread-123"),
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/tmp"))
+        );
+    }
 }

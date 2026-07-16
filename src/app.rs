@@ -54,6 +54,12 @@ struct PendingRequest {
     kind: PendingRequestKind,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachRequest {
+    pub thread_id: String,
+    pub cwd: PathBuf,
+}
+
 pub struct App {
     cwd: PathBuf,
     include_all: bool,
@@ -72,6 +78,7 @@ pub struct App {
     notice: String,
     scroll_back: usize,
     message_view_height: usize,
+    attach_requested: Option<AttachRequest>,
 }
 
 impl App {
@@ -94,6 +101,7 @@ impl App {
             notice: "Connecting to Codex…".to_string(),
             scroll_back: 0,
             message_view_height: 1,
+            attach_requested: None,
         }
     }
 
@@ -192,10 +200,12 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert("\n")
             }
+            KeyCode::Enter if self.composer.text.is_empty() => self.request_attach(),
             KeyCode::Enter => self.submit(sender)?,
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
             KeyCode::Left => self.composer.move_left(),
+            KeyCode::Right if self.composer.text.is_empty() => self.request_attach(),
             KeyCode::Right => self.composer.move_right(),
             KeyCode::Home => self.composer.cursor = 0,
             KeyCode::End => self.composer.cursor = self.composer.text.len(),
@@ -213,6 +223,35 @@ impl App {
 
     pub fn insert_text(&mut self, text: &str) {
         self.composer.insert(text);
+    }
+
+    pub fn take_attach_request(&mut self) -> Option<AttachRequest> {
+        self.attach_requested.take()
+    }
+
+    pub fn refresh_after_attach(
+        &mut self,
+        thread_id: &str,
+        sender: &mut impl RpcSender,
+    ) -> Result<()> {
+        self.select_session(thread_id);
+        let id = sender.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
+        )?;
+        self.pending_calls.insert(
+            id,
+            PendingCall::ThreadRead {
+                thread_id: thread_id.to_string(),
+            },
+        );
+        self.scroll_back = 0;
+        self.notice = "Returned from attached session".to_string();
+        Ok(())
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = notice.into();
     }
 
     pub fn sessions(&self) -> &[Session] {
@@ -978,6 +1017,25 @@ impl App {
         self.ensure_selected_history(sender)
     }
 
+    fn request_attach(&mut self) {
+        let Some((thread_id, cwd)) = self
+            .selected_session()
+            .map(|session| (session.id.clone(), session.cwd.clone()))
+        else {
+            self.notice = "No session selected".to_string();
+            return;
+        };
+        self.attach_requested = Some(AttachRequest {
+            thread_id,
+            cwd: if cwd.is_empty() {
+                self.cwd.clone()
+            } else {
+                PathBuf::from(cwd)
+            },
+        });
+        self.notice = "Attaching to native Codex…".to_string();
+    }
+
     fn toggle_compose_target(&mut self) {
         self.composer.target = match self.composer.target {
             ComposeTarget::NewTask if !self.sessions.is_empty() => ComposeTarget::Reply,
@@ -1375,5 +1433,28 @@ mod tests {
             ],
         };
         assert_eq!(resolve_question_answer(&question, "2"), "Second");
+    }
+
+    #[test]
+    fn attach_targets_the_selected_session_and_its_directory() {
+        let mut app = App::new(PathBuf::from("/tmp"), true);
+        app.sessions.push(Session {
+            id: "thread-123".to_string(),
+            title: "Test".to_string(),
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some(THREAD_SOURCE.to_string()),
+            status: SessionStatus::Completed,
+            active_turn_id: None,
+            messages: Vec::new(),
+            history_loaded: true,
+        });
+
+        app.request_attach();
+        let request = app.take_attach_request().expect("attach request");
+        assert_eq!(request.thread_id, "thread-123");
+        assert_eq!(request.cwd, PathBuf::from("/tmp/project"));
     }
 }

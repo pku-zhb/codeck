@@ -45,12 +45,17 @@ codex-deck --check
 ## Keys
 
 - `Up` / `Down`: select a session
+- `Enter` / `Right`: attach the selected session in the native Codex TUI when
+  the composer is empty
 - `Tab`: switch the composer between a new task and a reply
 - `Ctrl+N`: compose a new task
 - `Ctrl+R`: reply to the selected session
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
 - `Ctrl+C`: close the dashboard; running tasks continue
+
+While attached, use native Codex normally. Run `/exit` to return to the deck;
+the dashboard reconnects to the same app-server and refreshes the transcript.
 
 When Codex requests approval, reply with `y` (once), `a` (session), or `n`.
 When Codex asks several questions, separate answers with `|`.

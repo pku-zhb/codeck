@@ -30,6 +30,7 @@ pub struct CodexClient {
     outgoing: Sender<ClientCommand>,
     incoming: Receiver<ClientEvent>,
     next_id: u64,
+    endpoint: String,
 }
 
 enum ClientCommand {
@@ -41,6 +42,7 @@ impl CodexClient {
     pub fn connect() -> Result<Self> {
         let socket = ensure_app_server()?;
         let websocket = connect_websocket(&socket)?;
+        let endpoint = format!("unix://{}", socket.display());
         let (event_tx, incoming) = mpsc::channel();
         let (outgoing, command_rx) = mpsc::channel();
         thread::spawn(move || run_websocket(websocket, command_rx, event_tx));
@@ -49,11 +51,16 @@ impl CodexClient {
             outgoing,
             incoming,
             next_id: 1,
+            endpoint,
         })
     }
 
     pub fn try_recv(&self) -> Option<ClientEvent> {
         self.incoming.try_recv().ok()
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     fn send(&mut self, message: Value) -> Result<()> {
