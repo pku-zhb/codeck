@@ -566,38 +566,40 @@ fn table_record_trigger_width(width: usize) -> usize {
 fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
     let column_count = table_column_count(table);
     let column_widths = table_column_widths(table, column_count);
-    table
-        .rows
-        .iter()
-        .map(|row| {
-            let mut line = StyledLine::default();
-            for index in 0..column_count {
-                if index > 0 {
-                    line.push(" │ ", Style::default().fg(Color::DarkGray), None);
-                }
-                let cell = row.cells.get(index);
-                let cell_width = cell.map(StyledLine::width).unwrap_or_default();
-                let padding = column_widths[index].saturating_sub(cell_width);
-                let alignment = table
-                    .alignments
-                    .get(index)
-                    .copied()
-                    .unwrap_or(Alignment::None);
-                let (left_pad, right_pad) = table_cell_padding(alignment, padding);
-                push_spaces(&mut line, left_pad);
-                if let Some(cell) = cell {
-                    push_table_cell_spans(
-                        &mut line,
-                        cell,
-                        table_compact_cell_style(row, index),
-                        row.is_header || index == 0,
-                    );
-                }
-                push_spaces(&mut line, right_pad);
+    let mut output = Vec::new();
+    for row in &table.rows {
+        let mut line = StyledLine::default();
+        for index in 0..column_count {
+            if index > 0 {
+                line.push(" │ ", Style::default().fg(Color::DarkGray), None);
             }
-            line
-        })
-        .collect()
+            let cell = row.cells.get(index);
+            let cell_width = cell.map(StyledLine::width).unwrap_or_default();
+            let padding = column_widths[index].saturating_sub(cell_width);
+            let alignment = table
+                .alignments
+                .get(index)
+                .copied()
+                .unwrap_or(Alignment::None);
+            let (left_pad, right_pad) = table_cell_padding(alignment, padding);
+            push_spaces(&mut line, left_pad);
+            if let Some(cell) = cell {
+                push_table_cell_spans(
+                    &mut line,
+                    cell,
+                    table_compact_cell_style(row),
+                    row.is_header,
+                );
+            }
+            push_spaces(&mut line, right_pad);
+        }
+        let line_width = line.width();
+        output.push(line);
+        if row.is_header {
+            output.push(table_header_separator(line_width));
+        }
+    }
+    output
 }
 
 fn table_column_count(table: &TableState) -> usize {
@@ -629,11 +631,11 @@ fn table_cell_padding(alignment: Alignment, padding: usize) -> (usize, usize) {
     }
 }
 
-fn table_compact_cell_style(row: &TableRow, index: usize) -> Style {
-    if row.is_header || index == 0 {
-        table_key_style()
+fn table_compact_cell_style(row: &TableRow) -> Style {
+    if row.is_header {
+        table_header_style()
     } else {
-        table_value_style()
+        Style::default()
     }
 }
 
@@ -657,14 +659,17 @@ fn push_table_cell_spans(line: &mut StyledLine, cell: &StyledLine, overlay: Styl
     }
 }
 
-fn table_key_style() -> Style {
+fn table_header_style() -> Style {
     Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
 }
 
-fn table_value_style() -> Style {
-    Style::default().fg(Color::Yellow)
+fn table_header_separator(width: usize) -> StyledLine {
+    StyledLine::from_span(
+        "─".repeat(width.max(1)),
+        Style::default().fg(Color::DarkGray),
+    )
 }
 
 fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
@@ -698,7 +703,7 @@ fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
                 None,
             );
             line.push(" ", Style::default(), None);
-            push_table_cell_spans(&mut line, cell, table_value_style(), false);
+            push_table_cell_spans(&mut line, cell, Style::default(), false);
             row_lines.push(line);
         }
         if row_lines.is_empty() {
@@ -1019,6 +1024,12 @@ mod tests {
             .expect("field label");
         assert_eq!(label.style.fg, Some(Color::Cyan));
         assert!(label.style.add_modifier.contains(Modifier::BOLD));
+        let value = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("NVDA"))
+            .expect("record value");
+        assert_ne!(value.style.fg, Some(Color::Yellow));
     }
 
     #[test]
@@ -1061,6 +1072,10 @@ mod tests {
             80,
         );
         let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .collect::<Vec<_>>();
 
         assert!(
             rendered.iter().any(|line| line == "公司   │ 代码"),
@@ -1070,6 +1085,7 @@ mod tests {
             rendered.iter().any(|line| line == "英伟达 │ NVDA"),
             "rendered={rendered:?}"
         );
+        assert_eq!(separators.len(), 1, "rendered={rendered:?}");
         assert!(!rendered.iter().any(|line| line == "公司: 英伟达"));
     }
 
@@ -1096,6 +1112,10 @@ mod tests {
             .iter()
             .map(|line| UnicodeWidthStr::width(line.rsplit('│').next().unwrap_or_default()))
             .collect::<Vec<_>>();
+        let separators = rendered
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
+            .collect::<Vec<_>>();
 
         assert_eq!(table_lines.len(), 3, "rendered={rendered:?}");
         assert!(
@@ -1107,6 +1127,11 @@ mod tests {
             result_column_widths
                 .windows(2)
                 .all(|pair| pair[0] == pair[1])
+        );
+        assert_eq!(separators.len(), 1, "rendered={rendered:?}");
+        assert_eq!(
+            UnicodeWidthStr::width(separators[0].as_str()),
+            UnicodeWidthStr::width(table_lines[0].as_str())
         );
         assert!(!rendered.iter().any(|line| line.contains("项目:")));
 
@@ -1123,16 +1148,16 @@ mod tests {
 
         let key = spans
             .iter()
-            .find(|span| span.text == "旧 AZ N2+")
+            .find(|span| span.text.contains("旧 AZ N2+"))
             .expect("key");
-        assert_eq!(key.style.fg, Some(Color::Cyan));
-        assert!(key.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(key.style.fg, None);
+        assert!(!key.style.add_modifier.contains(Modifier::BOLD));
 
         let value = spans
             .iter()
-            .find(|span| span.text == "80-100k")
+            .find(|span| span.text.contains("80-100k"))
             .expect("value");
-        assert_eq!(value.style.fg, Some(Color::Yellow));
+        assert_eq!(value.style.fg, None);
     }
 
     #[test]
