@@ -113,6 +113,18 @@ struct SkillPicker {
     selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlXAction {
+    Pause,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtrlXConfirmation {
+    thread_id: String,
+    action: CtrlXAction,
+}
+
 #[derive(Debug, Clone)]
 pub struct SkillPickerView {
     pub items: Vec<SkillMetadata>,
@@ -150,6 +162,7 @@ pub struct App {
     settings_open: bool,
     settings_selection: PreviewVerbosity,
     settings_left_armed: bool,
+    ctrl_x_armed: Option<CtrlXConfirmation>,
     rename_previous: Option<Composer>,
     rename_thread_id: Option<String>,
 }
@@ -195,6 +208,7 @@ impl App {
             settings_open: false,
             settings_selection,
             settings_left_armed: false,
+            ctrl_x_armed: None,
             rename_previous: None,
             rename_thread_id: None,
         }
@@ -254,6 +268,12 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return Ok(());
+        }
+
+        let is_ctrl_x =
+            key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x');
+        if !is_ctrl_x {
+            self.ctrl_x_armed = None;
         }
 
         if self.settings_open {
@@ -320,7 +340,7 @@ impl App {
                 }
                 KeyCode::Char('x') => {
                     self.skill_picker = None;
-                    self.stop_or_remove_selected(sender)?;
+                    self.confirm_stop_or_remove(key.kind, sender)?;
                     return Ok(());
                 }
                 _ => {}
@@ -692,7 +712,7 @@ impl App {
             }
             PendingCall::TurnInterrupt { thread_id } => {
                 self.notice = format!(
-                    "Stopping {} · press Ctrl+X again after it completes to remove it",
+                    "Pausing {} · press Ctrl+X twice after it completes to remove it",
                     self.session_title(&thread_id)
                 );
             }
@@ -1859,7 +1879,7 @@ impl App {
         };
         if session.status.is_live() {
             let Some(turn_id) = session.active_turn_id.clone() else {
-                self.notice = "Loading the active turn before stopping it…".to_string();
+                self.notice = "Loading the active turn before pausing it…".to_string();
                 self.ensure_selected_history(sender)?;
                 return Ok(());
             };
@@ -1870,7 +1890,7 @@ impl App {
             )?;
             self.pending_calls
                 .insert(id, PendingCall::TurnInterrupt { thread_id });
-            self.notice = "Stopping session…".to_string();
+            self.notice = "Pausing session…".to_string();
             return Ok(());
         }
         let thread_id = session.id.clone();
@@ -1886,6 +1906,48 @@ impl App {
         self.scroll_back = 0;
         self.notice = "Reviewed session removed from the deck; Codex history was kept".to_string();
         self.ensure_selected_history(sender)
+    }
+
+    fn confirm_stop_or_remove(
+        &mut self,
+        key_kind: KeyEventKind,
+        sender: &mut impl RpcSender,
+    ) -> Result<()> {
+        if key_kind == KeyEventKind::Repeat {
+            return Ok(());
+        }
+        if self.show_all {
+            self.ctrl_x_armed = None;
+            self.notice = "Remove is available in the lifecycle view, without --all".to_string();
+            return Ok(());
+        }
+        let Some(session) = self.selected_session() else {
+            self.ctrl_x_armed = None;
+            self.notice = "No session selected".to_string();
+            return Ok(());
+        };
+        let action = if session.status.is_live() {
+            CtrlXAction::Pause
+        } else {
+            CtrlXAction::Remove
+        };
+        let confirmation = CtrlXConfirmation {
+            thread_id: session.id.clone(),
+            action,
+        };
+        let title = session.title.clone();
+        if self.ctrl_x_armed.as_ref() == Some(&confirmation) {
+            self.ctrl_x_armed = None;
+            return self.stop_or_remove_selected(sender);
+        }
+        self.ctrl_x_armed = Some(confirmation);
+        self.notice = match action {
+            CtrlXAction::Pause => format!("Press Ctrl+X again to pause {title}"),
+            CtrlXAction::Remove => format!(
+                "Press Ctrl+X again to remove {title} from the deck · Codex history will be kept"
+            ),
+        };
+        Ok(())
     }
 
     pub fn is_pinned(&self, thread_id: &str) -> bool {
@@ -2958,8 +3020,18 @@ mod tests {
         app.sessions[0].status = SessionStatus::Completed;
         let mut sender = test_sender();
 
-        app.stop_or_remove_selected(&mut sender)
-            .expect("remove session");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("arm removal");
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.notice.contains("Press Ctrl+X again"));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("confirm removal");
 
         assert!(app.sessions.is_empty());
         assert!(!app.lifecycle.contains("review-thread"));
@@ -3241,8 +3313,28 @@ mod tests {
         app.sessions.push(session);
         let mut sender = test_sender();
 
-        app.stop_or_remove_selected(&mut sender)
-            .expect("interrupt session");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("arm pause");
+        assert!(sender.requests.is_empty());
+        assert!(app.notice.contains("Press Ctrl+X again"));
+        app.handle_key(
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            &mut sender,
+        )
+        .expect("ignore held key");
+        assert!(sender.requests.is_empty());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("confirm pause");
 
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(
@@ -3252,6 +3344,28 @@ mod tests {
                 json!({"threadId":"working-thread","turnId":"turn-1"})
             ))
         );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_x_confirmation_is_cancelled_by_an_intervening_key() {
+        let (mut app, state_path) = test_app(false);
+        let mut session = test_session("working-thread", "Working", SessionStatus::Working);
+        session.active_turn_id = Some("turn-1".to_string());
+        app.sessions.push(session);
+        let mut sender = test_sender();
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_x, &mut sender).expect("arm pause");
+        app.handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("intervening key");
+        app.handle_key(ctrl_x, &mut sender).expect("re-arm pause");
+
+        assert!(sender.requests.is_empty());
+        assert!(app.notice.contains("Press Ctrl+X again"));
         let _ = std::fs::remove_file(state_path);
     }
 

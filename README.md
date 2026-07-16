@@ -62,8 +62,9 @@ codex-deck --check
   system clipboard; pasting one or more image file paths also attaches them
 - `Ctrl+T`: pin or unpin the selected session
 - `Ctrl+R`: rename the selected session
-- `Ctrl+X`: stop a working session; remove a completed/failed session from the
-  deck while preserving its Codex history
+- `Ctrl+X`, twice consecutively: pause a working session; remove a
+  completed/failed session from the deck while preserving its Codex history;
+  holding the key does not confirm either action
 - `Enter`: send
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
 - Mouse wheel: scroll only the conversation preview; it never changes the
