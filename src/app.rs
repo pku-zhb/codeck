@@ -97,6 +97,8 @@ pub struct App {
     sessions: Vec<Session>,
     selected: usize,
     composer: Composer,
+    new_draft: Composer,
+    reply_drafts: HashMap<String, Composer>,
     pending_calls: HashMap<u64, PendingCall>,
     pending_requests: Vec<PendingRequest>,
     queued_replies: HashMap<String, String>,
@@ -133,6 +135,8 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             composer: Composer::default(),
+            new_draft: Composer::default(),
+            reply_drafts: HashMap::new(),
             pending_calls: HashMap::new(),
             pending_requests: Vec::new(),
             queued_replies: HashMap::new(),
@@ -226,7 +230,7 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     self.cancel_rename();
-                    self.composer.target = ComposeTarget::NewTask;
+                    self.switch_to_new_draft();
                     self.notice = "New task".to_string();
                     return Ok(());
                 }
@@ -519,8 +523,9 @@ impl App {
                 let thread_id = session.id.clone();
                 self.track_session(&thread_id)?;
                 self.merge_session(session);
+                self.cache_current_draft();
                 self.select_session(&thread_id);
-                self.composer.target = ComposeTarget::Reply;
+                self.load_reply_draft(&thread_id);
                 self.start_turn(&thread_id, &draft, sender)?;
             }
             PendingCall::ThreadResumeForReply { thread_id, draft } => {
@@ -635,10 +640,13 @@ impl App {
             }
             "thread/deleted" | "thread/archived" => {
                 if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
+                    let was_selected = self.selected_session().map(|session| session.id.as_str())
+                        == Some(thread_id);
                     self.sessions.retain(|session| session.id != thread_id);
                     self.lifecycle.dismiss(thread_id);
                     self.lifecycle.save().context("save session lifecycle")?;
                     self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+                    self.discard_reply_draft(thread_id, was_selected);
                 }
             }
             "turn/started" => self.handle_turn_started(&params)?,
@@ -861,6 +869,7 @@ impl App {
                 return Ok(());
             }
             self.composer.take();
+            self.cache_current_draft();
             self.answer_pending_request(&thread_id, &text, sender)?;
             return Ok(());
         }
@@ -873,6 +882,7 @@ impl App {
             text,
             images: self.composer.take_images(),
         };
+        self.cache_current_draft();
         self.scroll_back = 0;
 
         match target {
@@ -896,6 +906,7 @@ impl App {
                     self.notice = "No session selected; switched to new task".to_string();
                     self.composer.target = ComposeTarget::NewTask;
                     self.restore_draft(draft);
+                    self.cache_current_draft();
                     return Ok(());
                 };
                 self.track_session(&thread_id)?;
@@ -1266,18 +1277,26 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize, sender: &mut impl RpcSender) -> Result<()> {
+        if self.composer.target == ComposeTarget::Rename {
+            self.cancel_rename();
+        }
         if self.sessions.is_empty() {
-            self.composer.target = ComposeTarget::NewTask;
+            self.switch_to_new_draft();
             return Ok(());
         }
+        let load_reply = self.composer.target == ComposeTarget::Reply
+            || (self.composer.target == ComposeTarget::NewTask
+                && self.composer.text.is_empty()
+                && self.composer.images.is_empty());
+        self.cache_current_draft();
         let last = self.sessions.len() - 1;
         self.selected = if delta < 0 {
             self.selected.saturating_sub(delta.unsigned_abs())
         } else {
             self.selected.saturating_add(delta as usize).min(last)
         };
-        if self.composer.text.is_empty() {
-            self.composer.target = ComposeTarget::Reply;
+        if load_reply {
+            self.load_selected_reply_draft();
         }
         self.scroll_back = 0;
         self.ensure_selected_history(sender)
@@ -1321,12 +1340,62 @@ impl App {
             self.notice = "Rename cancelled".to_string();
             return;
         }
-        self.composer.target = match self.composer.target {
-            ComposeTarget::NewTask if !self.sessions.is_empty() => ComposeTarget::Reply,
-            ComposeTarget::NewTask => ComposeTarget::NewTask,
-            ComposeTarget::Reply => ComposeTarget::NewTask,
+        match self.composer.target {
+            ComposeTarget::NewTask if !self.sessions.is_empty() => {
+                self.cache_current_draft();
+                self.load_selected_reply_draft();
+            }
+            ComposeTarget::NewTask => {}
+            ComposeTarget::Reply => self.switch_to_new_draft(),
             ComposeTarget::Rename => unreachable!("rename handled above"),
+        }
+    }
+
+    fn cache_current_draft(&mut self) {
+        match self.composer.target {
+            ComposeTarget::NewTask => {
+                let mut draft = self.composer.clone();
+                draft.target = ComposeTarget::NewTask;
+                self.new_draft = draft;
+            }
+            ComposeTarget::Reply => {
+                if let Some(thread_id) = self.selected_session().map(|session| session.id.clone()) {
+                    let mut draft = self.composer.clone();
+                    draft.target = ComposeTarget::Reply;
+                    self.reply_drafts.insert(thread_id, draft);
+                }
+            }
+            ComposeTarget::Rename => {}
+        }
+    }
+
+    fn switch_to_new_draft(&mut self) {
+        if self.composer.target != ComposeTarget::Rename {
+            self.cache_current_draft();
+        }
+        self.composer = self.new_draft.clone();
+        self.composer.target = ComposeTarget::NewTask;
+    }
+
+    fn load_selected_reply_draft(&mut self) {
+        let Some(thread_id) = self.selected_session().map(|session| session.id.clone()) else {
+            self.composer = self.new_draft.clone();
+            self.composer.target = ComposeTarget::NewTask;
+            return;
         };
+        self.load_reply_draft(&thread_id);
+    }
+
+    fn load_reply_draft(&mut self, thread_id: &str) {
+        self.composer = self
+            .reply_drafts
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_else(|| Composer {
+                target: ComposeTarget::Reply,
+                ..Composer::default()
+            });
+        self.composer.target = ComposeTarget::Reply;
     }
 
     fn start_rename(&mut self) {
@@ -1420,12 +1489,15 @@ impl App {
             return Ok(());
         }
         let thread_id = session.id.clone();
+        let was_selected =
+            self.selected_session().map(|session| session.id.as_str()) == Some(thread_id.as_str());
         self.lifecycle.dismiss(&thread_id);
         self.lifecycle.save().context("save session lifecycle")?;
         self.sessions.retain(|session| session.id != thread_id);
         self.pending_requests
             .retain(|request| request.thread_id != thread_id);
         self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+        self.discard_reply_draft(&thread_id, was_selected);
         self.scroll_back = 0;
         self.notice = "Reviewed session removed from the deck; Codex history was kept".to_string();
         self.ensure_selected_history(sender)
@@ -1433,6 +1505,16 @@ impl App {
 
     pub fn is_pinned(&self, thread_id: &str) -> bool {
         self.lifecycle.is_pinned(thread_id)
+    }
+
+    fn discard_reply_draft(&mut self, thread_id: &str, was_selected: bool) {
+        self.reply_drafts.remove(thread_id);
+        if self.rename_thread_id.as_deref() == Some(thread_id) {
+            self.cancel_rename();
+        }
+        if was_selected && self.composer.target == ComposeTarget::Reply {
+            self.load_selected_reply_draft();
+        }
     }
 
     fn session(&self, thread_id: &str) -> Option<&Session> {
@@ -2039,6 +2121,82 @@ mod tests {
                 .thread_id,
             "thread-123"
         );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn reply_drafts_follow_their_selected_sessions() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-a",
+            "Session A",
+            SessionStatus::Completed,
+        ));
+        app.sessions.push(test_session(
+            "thread-b",
+            "Session B",
+            SessionStatus::Completed,
+        ));
+        let mut sender = test_sender();
+        app.toggle_compose_target();
+        app.insert_text("reply for A");
+        app.composer.images.push(PathBuf::from("/tmp/a.png"));
+
+        app.move_selection(1, &mut sender).expect("select B");
+
+        assert_eq!(app.selected_session().expect("B").id, "thread-b");
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert!(app.composer.text.is_empty());
+        assert!(app.composer.images.is_empty());
+        app.insert_text("reply for B");
+
+        app.move_selection(-1, &mut sender).expect("return to A");
+
+        assert_eq!(app.composer.text, "reply for A");
+        assert_eq!(app.composer.images, vec![PathBuf::from("/tmp/a.png")]);
+        app.move_selection(1, &mut sender).expect("return to B");
+        assert_eq!(app.composer.text, "reply for B");
+        app.submit(&mut sender).expect("submit B reply");
+        assert_eq!(
+            sender.requests.last(),
+            Some(&("thread/resume".to_string(), json!({"threadId":"thread-b"})))
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn new_draft_is_global_and_separate_from_session_replies() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-a",
+            "Session A",
+            SessionStatus::Completed,
+        ));
+        app.sessions.push(test_session(
+            "thread-b",
+            "Session B",
+            SessionStatus::Completed,
+        ));
+        let mut sender = test_sender();
+        app.insert_text("global new task");
+
+        app.toggle_compose_target();
+        assert!(app.composer.text.is_empty());
+        app.insert_text("reply for A");
+        app.toggle_compose_target();
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+        assert_eq!(app.composer.text, "global new task");
+
+        app.move_selection(1, &mut sender)
+            .expect("select B without changing global draft");
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+        assert_eq!(app.composer.text, "global new task");
+        app.toggle_compose_target();
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert!(app.composer.text.is_empty());
+
+        app.move_selection(-1, &mut sender).expect("select A");
+        assert_eq!(app.composer.text, "reply for A");
         let _ = std::fs::remove_file(state_path);
     }
 

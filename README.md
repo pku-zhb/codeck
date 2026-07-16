@@ -67,6 +67,11 @@ Attached images are shown as an `🖼N` counter in the composer and are sent as
 native Codex `localImage` inputs. With an empty text field, `Backspace` removes
 the most recently attached image. Image-only prompts are supported.
 
+Drafts are isolated by intent: `New` has one global draft, while `Reply` keeps a
+separate in-memory draft for every session. Moving with `Up` / `Down` saves and
+restores the corresponding reply text, cursor, and image attachments, so a
+half-written reply cannot be sent to the newly selected session.
+
 While attached, use native Codex normally. Run `/exit` to return to the deck;
 the dashboard reconnects to the same app-server and refreshes the transcript.
 Sessions with large rollout files use a bounded 64 MiB tail preview instead of
