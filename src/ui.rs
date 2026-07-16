@@ -364,6 +364,7 @@ fn session_line(
     } else {
         Style::default()
     };
+    let pin = if pinned { "📌 " } else { "   " };
     let working = session.status == SessionStatus::Working;
     let lamp = if working { "● " } else { "  " };
     let lamp_style = if working {
@@ -371,12 +372,8 @@ fn session_line(
     } else {
         Style::default()
     };
-    let right = if pinned {
-        format!("{} 📌", session.leaf_directory())
-    } else {
-        session.leaf_directory()
-    };
-    let prefix_width = UnicodeWidthStr::width(lamp);
+    let right = session.leaf_directory();
+    let prefix_width = UnicodeWidthStr::width(pin) + UnicodeWidthStr::width(lamp);
     let right_width = UnicodeWidthStr::width(right.as_str());
     let title_budget = width
         .saturating_sub(prefix_width)
@@ -387,6 +384,7 @@ fn session_line(
     let spacer = " ".repeat(width.saturating_sub(used));
 
     Line::from(vec![
+        Span::raw(pin.to_string()),
         Span::styled(lamp.to_string(), lamp_style),
         Span::styled(title, row_style),
         Span::styled(spacer, row_style),
@@ -817,10 +815,11 @@ mod tests {
         assert!(!line.style.add_modifier.contains(Modifier::REVERSED));
         assert!(line.style.bg.is_none());
         assert!(!line.spans.iter().any(|span| span.content.contains('›')));
-        assert_eq!(line.spans[0].content, "● ");
-        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(line.spans[0].content, "   ");
+        assert_eq!(line.spans[1].content, "● ");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Green));
         assert!(
-            !line.spans[0]
+            !line.spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::SLOW_BLINK)
@@ -850,15 +849,16 @@ mod tests {
             };
 
             let line = session_line(&session, false, false, 40);
-            assert_eq!(line.spans[0].content, "  ");
+            assert_eq!(line.spans[0].content, "   ");
+            assert_eq!(line.spans[1].content, "  ");
             assert!(!line.spans.iter().any(|span| span.content.contains('●')));
             assert!(!line.spans.iter().any(|span| span.content.contains('›')));
-            assert_eq!(line.spans[1].style.fg, None);
+            assert_eq!(line.spans[2].style.fg, None);
         }
     }
 
     #[test]
-    fn pinned_session_shows_pin_after_directory() {
+    fn pinned_session_uses_reserved_left_slot() {
         let session = Session {
             id: "thread".to_string(),
             title: "Pinned session".to_string(),
@@ -875,7 +875,12 @@ mod tests {
         };
 
         let line = session_line(&session, true, false, 40);
-        assert_eq!(line.spans[3].content, "project 📌");
+        assert_eq!(line.spans[0].content, "📌 ");
+        assert_eq!(line.spans[4].content, "project");
+        assert_eq!(
+            UnicodeWidthStr::width(line.spans[0].content.as_ref()),
+            UnicodeWidthStr::width("   ")
+        );
     }
 
     #[test]
