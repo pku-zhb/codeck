@@ -1809,13 +1809,40 @@ fn notification_message(params: &Value) -> Option<String> {
 }
 
 fn remove_matching_local_user(session: &mut Session, text: &str) {
-    if let Some(index) = session
-        .messages
-        .iter()
-        .position(|entry| entry.id.starts_with("local-user-") && entry.text.trim() == text.trim())
-    {
+    let signature = user_message_signature(text);
+    if let Some(index) = session.messages.iter().position(|entry| {
+        entry.id.starts_with("local-user-") && user_message_signature(&entry.text) == signature
+    }) {
         session.messages.remove(index);
     }
+}
+
+fn user_message_signature(text: &str) -> (String, bool) {
+    let mut has_image = false;
+    let mut body_lines = Vec::new();
+    for line in text.lines() {
+        if is_image_marker(line.trim()) {
+            has_image = true;
+        } else {
+            body_lines.push(line);
+        }
+    }
+    let body = body_lines.join("\n").trim().to_string();
+    (body, has_image)
+}
+
+fn is_image_marker(line: &str) -> bool {
+    let Some(label) = line.strip_prefix("🖼 ") else {
+        return false;
+    };
+    if matches!(label, "image" | "local image") {
+        return true;
+    }
+    let mut parts = label.split_whitespace();
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(count), Some("image" | "images"), None) if count.parse::<usize>().is_ok()
+    )
 }
 
 fn unix_now() -> i64 {
@@ -2175,6 +2202,21 @@ mod tests {
             ]))),
             "Inspect this\n🖼 local image"
         );
+    }
+
+    #[test]
+    fn official_image_message_replaces_its_optimistic_local_preview() {
+        let mut session = test_session("image-thread", "Image", SessionStatus::Working);
+        session.messages.push(MessageEntry {
+            id: "local-user-1".to_string(),
+            kind: MessageKind::User,
+            text: "测试一下你是否真的收到了图\n\n🖼 1 image".to_string(),
+        });
+
+        remove_matching_local_user(&mut session, "测试一下你是否真的收到了图\n🖼 local image");
+
+        assert!(session.messages.is_empty());
+        assert_eq!(user_message_signature("🖼 2 images"), (String::new(), true));
     }
 
     #[test]
