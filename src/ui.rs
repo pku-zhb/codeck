@@ -617,10 +617,10 @@ fn composer_accent(target: ComposeTarget, pending: bool) -> Color {
 
 fn composer_background(target: ComposeTarget, pending: bool) -> Color {
     match target {
-        ComposeTarget::NewTask => Color::Rgb(4, 32, 18),
-        ComposeTarget::Reply if pending => Color::Rgb(42, 34, 6),
-        ComposeTarget::Reply => Color::Rgb(4, 28, 36),
-        ComposeTarget::Rename => Color::Rgb(34, 16, 42),
+        ComposeTarget::NewTask => Color::Rgb(31, 48, 40),
+        ComposeTarget::Reply if pending => Color::Rgb(59, 53, 33),
+        ComposeTarget::Reply => Color::Rgb(32, 49, 58),
+        ComposeTarget::Rename => Color::Rgb(55, 45, 64),
     }
 }
 
