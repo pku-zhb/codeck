@@ -4,6 +4,7 @@ mod clipboard;
 mod lifecycle;
 mod markdown;
 mod model;
+mod terminal_palette;
 mod transcript;
 mod ui;
 
@@ -95,6 +96,7 @@ fn run_check(mut app: App, mut client: CodexClient) -> Result<()> {
 fn run_tui(mut app: App, mut client: CodexClient) -> Result<()> {
     install_panic_restore_hook();
     enable_raw_mode().context("enable terminal raw mode")?;
+    let palette = terminal_palette::TerminalPalette::probe();
     let mut output = stdout();
     execute!(output, EnterAlternateScreen, EnableBracketedPaste)
         .context("enter terminal screen")?;
@@ -102,7 +104,7 @@ fn run_tui(mut app: App, mut client: CodexClient) -> Result<()> {
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
-    let result = run_event_loop(&mut terminal, &mut app, &mut client);
+    let result = run_event_loop(&mut terminal, &mut app, &mut client, &palette);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -111,6 +113,7 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     client: &mut CodexClient,
+    palette: &terminal_palette::TerminalPalette,
 ) -> Result<()> {
     let mut needs_draw = true;
     while !app.should_quit() {
@@ -135,7 +138,7 @@ fn run_event_loop(
             if app.take_force_full_redraw() {
                 force_full_redraw(terminal).context("force full TUI redraw")?;
             }
-            terminal.draw(|frame| ui::render(frame, app))?;
+            terminal.draw(|frame| ui::render(frame, app, palette))?;
             needs_draw = false;
         }
 

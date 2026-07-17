@@ -12,8 +12,9 @@ use crate::model::{
     ComposeTarget, ComposerToken, ComposerTokenKind, MessageEntry, MessageKind, PreviewVerbosity,
     SessionStatus,
 };
+use crate::terminal_palette::TerminalPalette;
 
-pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
         return;
@@ -74,7 +75,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_skill_picker(frame, chunks[3], picker);
     }
     render_separator(frame, chunks[4]);
-    render_composer(frame, chunks[5], app);
+    render_composer(frame, chunks[5], app, palette);
 }
 
 fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerView) {
@@ -527,14 +528,14 @@ fn message_style(kind: MessageKind) -> (&'static str, Style, Style) {
     }
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &TerminalPalette) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let pending = app.selected_has_pending_request();
     let prefix = composer_prefix(app.composer().target, pending);
     let accent = composer_accent(app.composer().target, pending);
-    let background = composer_background(app.composer().target, pending);
+    let background = composer_background(app.composer().target, pending, palette);
     let prefix_style = Style::default()
         .fg(accent)
         .bg(background)
@@ -615,12 +616,16 @@ fn composer_accent(target: ComposeTarget, pending: bool) -> Color {
     }
 }
 
-fn composer_background(target: ComposeTarget, pending: bool) -> Color {
+fn composer_background(target: ComposeTarget, pending: bool, palette: &TerminalPalette) -> Color {
+    palette.tinted_ansi(composer_ansi_index(target, pending))
+}
+
+fn composer_ansi_index(target: ComposeTarget, pending: bool) -> u8 {
     match target {
-        ComposeTarget::NewTask => Color::Rgb(31, 48, 40),
-        ComposeTarget::Reply if pending => Color::Rgb(59, 53, 33),
-        ComposeTarget::Reply => Color::Rgb(32, 49, 58),
-        ComposeTarget::Rename => Color::Rgb(55, 45, 64),
+        ComposeTarget::NewTask => 2,
+        ComposeTarget::Reply if pending => 3,
+        ComposeTarget::Reply => 6,
+        ComposeTarget::Rename => 5,
     }
 }
 
@@ -870,6 +875,26 @@ mod tests {
         assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 2), 2);
         assert_eq!(composer_panel_height("> ", "typed", "1234567890", 5, 10), 5);
         assert_eq!(composer_panel_height("> ", "1234567890", "hint", 5, 3), 3);
+    }
+
+    #[test]
+    fn composer_palette_uses_terminal_ansi_colors() {
+        let palette = TerminalPalette::default();
+        assert_eq!(
+            composer_background(ComposeTarget::Reply, false, &palette),
+            Color::Reset
+        );
+        assert_eq!(composer_ansi_index(ComposeTarget::NewTask, false), 2);
+        assert_eq!(composer_ansi_index(ComposeTarget::Reply, true), 3);
+        assert_eq!(composer_ansi_index(ComposeTarget::Reply, false), 6);
+        assert_eq!(composer_ansi_index(ComposeTarget::Rename, false), 5);
+        assert_eq!(composer_accent(ComposeTarget::NewTask, false), Color::Green);
+        assert_eq!(composer_accent(ComposeTarget::Reply, true), Color::Yellow);
+        assert_eq!(composer_accent(ComposeTarget::Reply, false), Color::Cyan);
+        assert_eq!(
+            composer_accent(ComposeTarget::Rename, false),
+            Color::Magenta
+        );
     }
 
     #[test]
