@@ -3,19 +3,25 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use serde_json::{Map, Value, json};
 
 use crate::client::{ClientEvent, RpcSender};
-use crate::clipboard::{image_paths_from_paste, save_clipboard_image};
+use crate::clipboard::{copy_text, image_paths_from_paste, save_clipboard_image};
 use crate::lifecycle::LifecycleStore;
 use crate::model::{
     ComposeTarget, Composer, MessageEntry, MessageKind, PreviewVerbosity, Session, SessionStatus,
     SkillReference,
 };
+use crate::selection::PreviewSelection;
 use crate::transcript::{TAIL_PREVIEW_BYTES, load_bounded_preview_if_large};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const LONG_PASTE_CHAR_THRESHOLD: usize = 1_000;
+const LONG_PASTE_LINE_THRESHOLD: usize = 8;
 const DOUBLE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
 const THREAD_SOURCE: &str = "codeck";
 const LEGACY_THREAD_SOURCE: &str = "codex-deck";
@@ -165,6 +171,7 @@ pub struct App {
     initial_scan_seen: BTreeSet<String>,
     sessions: Vec<Session>,
     selected: usize,
+    composer_open: bool,
     composer: Composer,
     new_draft: Composer,
     reply_drafts: HashMap<String, Composer>,
@@ -185,9 +192,13 @@ pub struct App {
     notice: String,
     scroll_back: usize,
     message_view_height: usize,
+    composer_layout_width: usize,
+    composer_prefix_width: usize,
+    preview_selection: PreviewSelection,
     attach_requested: Option<AttachRequest>,
     attach_right_armed: Option<Instant>,
     settings_open: bool,
+    help_open: bool,
     menu_tab: MenuTab,
     settings_selection: PreviewVerbosity,
     settings_left_armed: Option<Instant>,
@@ -215,6 +226,7 @@ impl App {
             initial_scan_seen: BTreeSet::new(),
             sessions: Vec::new(),
             selected: 0,
+            composer_open: false,
             composer: Composer::default(),
             new_draft: Composer::default(),
             reply_drafts: HashMap::new(),
@@ -235,9 +247,13 @@ impl App {
             notice: "Connecting to Codex…".to_string(),
             scroll_back: 0,
             message_view_height: 1,
+            composer_layout_width: 1,
+            composer_prefix_width: 0,
+            preview_selection: PreviewSelection::default(),
             attach_requested: None,
             attach_right_armed: None,
             settings_open: false,
+            help_open: false,
             menu_tab: MenuTab::Resume,
             settings_selection,
             settings_left_armed: None,
@@ -315,10 +331,19 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(());
         }
+        self.preview_selection.clear();
         self.expire_double_confirmations();
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key_char_eq(&key, 'c') {
             self.should_quit = true;
+            return Ok(());
+        }
+
+        if self.help_open {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                self.help_open = false;
+                self.force_full_redraw = true;
+            }
             return Ok(());
         }
 
@@ -331,13 +356,30 @@ impl App {
             return self.handle_settings_key(key, sender);
         }
 
+        if !self.composer_open
+            && key.code == KeyCode::Char('?')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            self.help_open = true;
+            self.force_full_redraw = true;
+            return Ok(());
+        }
+
         if self.handle_skill_picker_key(key) {
             return Ok(());
         }
 
+        if key.code == KeyCode::Esc {
+            if self.composer_open {
+                self.close_composer();
+            }
+            return Ok(());
+        }
+
         let attach_right = key.code == KeyCode::Right
-            && self.composer.text.is_empty()
-            && self.composer.target != ComposeTarget::Rename
+            && !self.composer_open
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -345,8 +387,7 @@ impl App {
             self.attach_right_armed = None;
         }
         let settings_left = key.code == KeyCode::Left
-            && self.composer.text.is_empty()
-            && self.composer.target != ComposeTarget::Rename
+            && !self.composer_open
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -356,7 +397,11 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
             self.skill_picker = None;
-            self.paste_clipboard_image();
+            if self.composer_open {
+                self.paste_clipboard_image();
+            } else {
+                self.notice = "Press Space to compose first".to_string();
+            }
             return Ok(());
         }
 
@@ -366,6 +411,7 @@ impl App {
                     self.skill_picker = None;
                     self.cancel_rename();
                     self.switch_to_new_draft();
+                    self.composer_open = true;
                     self.notice = "New task".to_string();
                     return Ok(());
                 }
@@ -374,22 +420,26 @@ impl App {
                     self.start_rename();
                     return Ok(());
                 }
-                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'a') => {
+                KeyCode::Char(character)
+                    if self.composer_open && character.eq_ignore_ascii_case(&'a') =>
+                {
                     self.composer.move_to_start();
                     self.skill_picker = None;
                     return Ok(());
                 }
-                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'e') => {
+                KeyCode::Char(character)
+                    if self.composer_open && character.eq_ignore_ascii_case(&'e') =>
+                {
                     self.composer.move_to_end();
                     self.skill_picker = None;
                     return Ok(());
                 }
-                KeyCode::Char('u') => {
+                KeyCode::Char('u') if self.composer_open => {
                     self.composer.reset();
                     self.skill_picker = None;
                     return Ok(());
                 }
-                KeyCode::Char('v') => {
+                KeyCode::Char('v') if self.composer_open => {
                     self.skill_picker = None;
                     self.paste_clipboard_image();
                     return Ok(());
@@ -409,6 +459,20 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Up if self.composer_open => {
+                self.composer.move_vertical(
+                    -1,
+                    self.composer_layout_width,
+                    self.composer_prefix_width,
+                );
+            }
+            KeyCode::Down if self.composer_open => {
+                self.composer.move_vertical(
+                    1,
+                    self.composer_layout_width,
+                    self.composer_prefix_width,
+                );
+            }
             KeyCode::Up => self.move_selection(-1, sender)?,
             KeyCode::Down => self.move_selection(1, sender)?,
             KeyCode::PageUp => {
@@ -421,41 +485,101 @@ impl App {
                     .scroll_back
                     .saturating_sub(self.message_view_height.saturating_sub(1).max(1));
             }
-            KeyCode::Tab | KeyCode::BackTab => self.toggle_compose_target(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Tab | KeyCode::BackTab if self.composer_open => self.toggle_compose_target(),
+            KeyCode::Enter if self.composer_open && key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert("\n")
             }
-            KeyCode::Enter if self.composer.target == ComposeTarget::Rename => {
+            KeyCode::Enter
+                if self.composer_open && self.composer.target == ComposeTarget::Rename =>
+            {
                 self.submit(sender)?
             }
-            KeyCode::Enter => self.submit(sender)?,
+            KeyCode::Enter if self.composer_open => self.submit(sender)?,
             KeyCode::Backspace
-                if self.composer.text.is_empty() && !self.composer.images.is_empty() =>
+                if self.composer_open
+                    && self.composer.text.is_empty()
+                    && !self.composer.images.is_empty() =>
             {
                 self.composer.images.pop();
                 self.notice = "Removed last image".to_string();
             }
-            KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Delete => self.composer.delete(),
+            KeyCode::Backspace if self.composer_open => self.composer.backspace(),
+            KeyCode::Delete if self.composer_open => self.composer.delete(),
             KeyCode::Left if settings_left && key.kind == KeyEventKind::Repeat => {}
             KeyCode::Left if settings_left => self.confirm_settings()?,
-            KeyCode::Left => self.composer.move_left(),
+            KeyCode::Left if self.composer_open => self.composer.move_left(),
             KeyCode::Right if attach_right && key.kind == KeyEventKind::Repeat => {}
             KeyCode::Right if attach_right => self.confirm_attach()?,
-            KeyCode::Right => self.composer.move_right(),
-            KeyCode::Home => self.composer.move_to_start(),
-            KeyCode::End => self.composer.move_to_end(),
+            KeyCode::Right if self.composer_open => self.composer.move_right(),
+            KeyCode::Home if self.composer_open => self.composer.move_to_start(),
+            KeyCode::End if self.composer_open => self.composer.move_to_end(),
+            KeyCode::Char(' ')
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                if !self.composer_open {
+                    self.open_composer();
+                } else if self.composer.target != ComposeTarget::Rename
+                    && !self.composer_has_input()
+                {
+                    self.close_composer();
+                } else {
+                    self.composer.insert(" ");
+                }
+            }
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if self.composer_open
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.composer.insert(&character.to_string())
             }
             _ => {}
         }
-        self.sync_skill_picker(sender)?;
+        if self.composer_open {
+            self.sync_skill_picker(sender)?;
+        } else {
+            self.skill_picker = None;
+        }
         Ok(())
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.settings_open {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_preview(3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_preview(-3);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !self.preview_selection.begin(mouse.column, mouse.row) {
+                    self.preview_selection.clear();
+                }
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.preview_selection.update(mouse.column, mouse.row)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.preview_selection.finish(mouse.column, mouse.row) {
+                    let characters = text.chars().count();
+                    self.notice = match copy_text(&text) {
+                        Ok(()) => format!("Copied {characters} characters"),
+                        Err(error) => format!("Could not copy selection: {error:#}"),
+                    };
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -474,6 +598,10 @@ impl App {
             }
             return;
         }
+        if !self.composer_open {
+            self.notice = "Press Space to compose first".to_string();
+            return;
+        }
         self.skill_picker = None;
         if text.is_empty() {
             self.paste_clipboard_image();
@@ -481,7 +609,12 @@ impl App {
         }
         let paths = image_paths_from_paste(text);
         if paths.is_empty() {
-            self.insert_text(text);
+            if self.composer.target != ComposeTarget::Rename && should_collapse_paste(text) {
+                self.attach_right_armed = None;
+                self.composer.attach_pasted_text(text.to_string());
+            } else {
+                self.insert_text(text);
+            }
         } else {
             self.add_images(paths);
         }
@@ -561,6 +694,14 @@ impl App {
         &self.composer
     }
 
+    pub fn composer_open(&self) -> bool {
+        self.composer_open
+    }
+
+    pub fn help_open(&self) -> bool {
+        self.help_open
+    }
+
     pub fn notice(&self) -> &str {
         &self.notice
     }
@@ -586,6 +727,7 @@ impl App {
     }
 
     pub fn scroll_preview(&mut self, lines: isize) {
+        self.preview_selection.clear();
         if lines >= 0 {
             self.scroll_back = self.scroll_back.saturating_add(lines as usize);
         } else {
@@ -595,6 +737,23 @@ impl App {
 
     pub fn set_message_view_height(&mut self, value: usize) {
         self.message_view_height = value.max(1);
+    }
+
+    pub fn set_composer_layout(&mut self, width: usize, prefix_width: usize) {
+        self.composer_layout_width = width.max(1);
+        self.composer_prefix_width = prefix_width;
+    }
+
+    pub fn set_preview_surface(&mut self, area: Rect, lines: Vec<String>) {
+        self.preview_selection.update_surface(area, lines);
+    }
+
+    pub fn clear_preview_surface(&mut self) {
+        self.preview_selection.clear_surface();
+    }
+
+    pub fn preview_selection_range(&self, row: usize) -> Option<(usize, usize)> {
+        self.preview_selection.range_for_row(row)
     }
 
     pub fn should_quit(&self) -> bool {
@@ -633,13 +792,19 @@ impl App {
 
     pub fn skill_picker_view(&self) -> Option<SkillPickerView> {
         let picker = self.skill_picker.as_ref()?;
-        let items = self
+        let mut ranked_items = self
             .skills_by_cwd
             .get(&picker.cwd)
             .into_iter()
             .flatten()
-            .filter(|skill| skill_matches(skill, &picker.query))
-            .cloned()
+            .filter_map(|skill| {
+                skill_match_priority(skill, &picker.query).map(|priority| (priority, skill.clone()))
+            })
+            .collect::<Vec<_>>();
+        ranked_items.sort_by_key(|(priority, _)| *priority);
+        let items = ranked_items
+            .into_iter()
+            .map(|(_, skill)| skill)
             .collect::<Vec<_>>();
         Some(SkillPickerView {
             selected: picker.selected.min(items.len().saturating_sub(1)),
@@ -857,7 +1022,12 @@ impl App {
                 if let Some(session) = self.session_mut(&thread_id) {
                     session.title = name.clone();
                 }
+                let was_rename = self.rename_thread_id.is_some();
                 self.cancel_rename();
+                if was_rename {
+                    self.switch_to_new_draft();
+                    self.composer_open = false;
+                }
                 self.notice = format!("Renamed session to {name}");
                 self.sort_sessions_preserving_selection();
             }
@@ -1177,6 +1347,7 @@ impl App {
             self.composer.clear_text_keep_images();
             self.cache_current_draft();
             self.answer_pending_request(&thread_id, &text, sender)?;
+            self.hide_composer_after_submit();
             return Ok(());
         }
 
@@ -1240,6 +1411,7 @@ impl App {
             }
             ComposeTarget::Rename => unreachable!("rename handled above"),
         }
+        self.hide_composer_after_submit();
         Ok(())
     }
 
@@ -1666,10 +1838,7 @@ impl App {
             self.switch_to_new_draft();
             return Ok(());
         }
-        let load_reply = self.composer.target == ComposeTarget::Reply
-            || (self.composer.target == ComposeTarget::NewTask
-                && self.composer.text.is_empty()
-                && self.composer.images.is_empty());
+        let load_reply = self.composer_open && self.composer.target == ComposeTarget::Reply;
         self.cache_current_draft();
         let last = self.sessions.len() - 1;
         self.selected = if delta < 0 {
@@ -1774,6 +1943,10 @@ impl App {
             }
             KeyCode::Tab => {
                 self.accept_selected_skill();
+                true
+            }
+            KeyCode::Esc => {
+                self.skill_picker = None;
                 true
             }
             _ => false,
@@ -2037,6 +2210,7 @@ impl App {
         self.merge_session(session);
         self.select_session(&thread_id);
         self.load_reply_draft(&thread_id);
+        self.composer_open = true;
         self.settings_open = false;
         self.settings_left_armed = None;
         self.history_picker = None;
@@ -2062,6 +2236,35 @@ impl App {
             ComposeTarget::Reply => self.switch_to_new_draft(),
             ComposeTarget::Rename => unreachable!("rename handled above"),
         }
+    }
+
+    fn composer_has_input(&self) -> bool {
+        !self.composer.text.is_empty() || !self.composer.images.is_empty()
+    }
+
+    fn open_composer(&mut self) {
+        self.composer_open = true;
+        if self.selected_session().is_some() {
+            self.load_selected_reply_draft();
+        } else {
+            self.switch_to_new_draft();
+        }
+        self.notice.clear();
+    }
+
+    fn close_composer(&mut self) {
+        if self.composer.target == ComposeTarget::Rename {
+            self.cancel_rename();
+        }
+        self.switch_to_new_draft();
+        self.composer_open = false;
+        self.skill_picker = None;
+        self.notice.clear();
+    }
+
+    fn hide_composer_after_submit(&mut self) {
+        self.composer_open = false;
+        self.skill_picker = None;
     }
 
     fn cache_current_draft(&mut self) {
@@ -2123,11 +2326,12 @@ impl App {
             self.rename_previous = Some(self.composer.clone());
         }
         self.rename_thread_id = Some(thread_id);
+        self.composer_open = true;
         self.composer.target = ComposeTarget::Rename;
         self.composer.reset();
         self.composer.text = title;
         self.composer.cursor = self.composer.text.len();
-        self.notice = "Edit the name and press Enter · Tab cancels".to_string();
+        self.notice = "Edit the name and press Enter · Esc cancels".to_string();
     }
 
     fn cancel_rename(&mut self) {
@@ -2369,13 +2573,28 @@ fn active_skill_query(text: &str, cursor: usize) -> Option<(usize, String)> {
     Some((start, query.to_string()))
 }
 
-fn skill_matches(skill: &SkillMetadata, query: &str) -> bool {
+fn skill_match_priority(skill: &SkillMetadata, query: &str) -> Option<u8> {
     if query.is_empty() {
-        return true;
+        return Some(0);
     }
     let query = query.to_ascii_lowercase();
-    skill.name.to_ascii_lowercase().contains(&query)
-        || skill.description.to_ascii_lowercase().contains(&query)
+    let name = skill.name.to_ascii_lowercase();
+    if name == query {
+        Some(0)
+    } else if name.starts_with(&query) {
+        Some(1)
+    } else if name.contains(&query) {
+        Some(2)
+    } else if skill.description.to_ascii_lowercase().contains(&query) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn should_collapse_paste(text: &str) -> bool {
+    text.chars().count() >= LONG_PASTE_CHAR_THRESHOLD
+        || text.split('\n').count() >= LONG_PASTE_LINE_THRESHOLD
 }
 
 fn history_session_matches(session: &Session, query: &str) -> bool {
@@ -3176,6 +3395,7 @@ mod tests {
     fn left_arrow_keeps_editing_nonempty_composer() {
         let (mut app, state_path) = test_app(true);
         let mut sender = test_sender();
+        app.composer_open = true;
         app.insert_text("abc");
 
         app.handle_key(
@@ -3195,9 +3415,110 @@ mod tests {
     }
 
     #[test]
+    fn space_opens_reply_and_escape_closes_it_without_losing_the_draft() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-a",
+            "Session A",
+            SessionStatus::Completed,
+        ));
+        let mut sender = test_sender();
+        let plain_space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("ignore typing while composer is closed");
+        assert!(app.composer.text.is_empty());
+        app.handle_key(plain_space, &mut sender)
+            .expect("open empty reply");
+        assert!(app.composer_open);
+        assert!(app.notice().is_empty());
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
+            .expect("switch to new task inside composer");
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
+            .expect("switch back to reply inside composer");
+        app.handle_key(plain_space, &mut sender)
+            .expect("close empty reply with space");
+        assert!(!app.composer_open);
+        assert!(app.notice().is_empty());
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+
+        app.handle_key(plain_space, &mut sender)
+            .expect("reopen reply");
+        app.insert_text("saved draft");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("close populated reply");
+        assert!(!app.composer_open);
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+
+        app.handle_key(plain_space, &mut sender)
+            .expect("reopen saved reply");
+        assert_eq!(app.composer.text, "saved draft");
+        app.handle_key(plain_space, &mut sender)
+            .expect("insert a regular space into populated reply");
+        assert_eq!(app.composer.text, "saved draft ");
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn arrows_edit_while_open_and_select_sessions_only_after_close() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-a",
+            "Session A",
+            SessionStatus::Completed,
+        ));
+        app.sessions.push(test_session(
+            "thread-b",
+            "Session B",
+            SessionStatus::Completed,
+        ));
+        app.composer_open = true;
+        app.set_composer_layout(6, 2);
+        app.insert_text("abcdefghij");
+        let mut sender = test_sender();
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut sender)
+            .expect("move to wrapped row above");
+        assert_eq!(app.composer.cursor, 4);
+        assert_eq!(app.selected, 0);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("move to wrapped row below");
+        assert_eq!(app.composer.cursor, app.composer.text.len());
+        assert_eq!(app.selected, 0);
+
+        app.composer.reset();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("keep the session while empty composer is open");
+        assert_eq!(app.selected, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("close composer");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("select next session after closing composer");
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn ctrl_a_and_ctrl_e_move_the_composer_cursor() {
         let (mut app, state_path) = test_app(true);
         let mut sender = test_sender();
+        app.composer_open = true;
         app.insert_text("ab中文");
         app.composer.cursor = 2;
 
@@ -3220,6 +3541,7 @@ mod tests {
     fn dollar_opens_codex_skill_picker_and_sends_structured_skill_input() {
         let (mut app, state_path) = test_app(true);
         let mut sender = test_sender();
+        app.composer_open = true;
 
         app.handle_key(
             KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE),
@@ -3328,9 +3650,135 @@ mod tests {
             path: "/tmp/documents/SKILL.md".to_string(),
             scope: "user".to_string(),
         };
-        assert!(skill_matches(&skill, "doc"));
-        assert!(skill_matches(&skill, "google"));
-        assert!(!skill_matches(&skill, "slides"));
+        assert_eq!(skill_match_priority(&skill, "documents"), Some(0));
+        assert_eq!(skill_match_priority(&skill, "doc"), Some(1));
+        assert_eq!(skill_match_priority(&skill, "ument"), Some(2));
+        assert_eq!(skill_match_priority(&skill, "google"), Some(3));
+        assert_eq!(skill_match_priority(&skill, "slides"), None);
+    }
+
+    #[test]
+    fn skill_picker_prioritizes_name_matches_over_description_matches() {
+        let (mut app, state_path) = test_app(false);
+        app.skill_picker = Some(SkillPicker {
+            cwd: "/tmp".to_string(),
+            query_start: 0,
+            query: "doc".to_string(),
+            selected: 0,
+        });
+        app.skills_by_cwd.insert(
+            "/tmp".to_string(),
+            vec![
+                SkillMetadata {
+                    name: "research-helper".to_string(),
+                    description: "Search and edit documents".to_string(),
+                    path: "/tmp/research-helper/SKILL.md".to_string(),
+                    scope: "user".to_string(),
+                },
+                SkillMetadata {
+                    name: "my-doc-tool".to_string(),
+                    description: "Utilities".to_string(),
+                    path: "/tmp/my-doc-tool/SKILL.md".to_string(),
+                    scope: "user".to_string(),
+                },
+                SkillMetadata {
+                    name: "documents".to_string(),
+                    description: "Word processing".to_string(),
+                    path: "/tmp/documents/SKILL.md".to_string(),
+                    scope: "user".to_string(),
+                },
+                SkillMetadata {
+                    name: "doc".to_string(),
+                    description: "Exact name".to_string(),
+                    path: "/tmp/doc/SKILL.md".to_string(),
+                    scope: "user".to_string(),
+                },
+            ],
+        );
+
+        let names = app
+            .skill_picker_view()
+            .expect("skill picker")
+            .items
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["doc", "documents", "my-doc-tool", "research-helper"]
+        );
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn long_paste_is_collapsed_in_the_composer_and_expanded_for_submission() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+        app.composer_open = true;
+        let pasted = "x".repeat(LONG_PASTE_CHAR_THRESHOLD);
+
+        app.insert_paste(&pasted);
+        assert_eq!(
+            app.composer.text,
+            format!("[Pasted text #1 +{} chars] ", pasted.len())
+        );
+        assert_eq!(app.composer.prompt_text(), pasted);
+
+        app.submit(&mut sender).expect("submit collapsed paste");
+        assert!(!app.composer_open);
+        let draft = app
+            .pending_calls
+            .values()
+            .find_map(|call| match call {
+                PendingCall::ThreadStart { draft } => Some(draft),
+                _ => None,
+            })
+            .expect("pending thread with pasted text");
+        assert_eq!(draft.text, pasted);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn successful_new_and_reply_submissions_hide_the_composer() {
+        let (mut new_app, new_state_path) = test_app(false);
+        let mut new_sender = test_sender();
+        new_app.composer_open = true;
+        new_app.insert_text("start a task");
+
+        new_app.submit(&mut new_sender).expect("submit new task");
+        assert!(!new_app.composer_open);
+        assert_eq!(new_app.notice(), "Starting background session…");
+
+        let (mut reply_app, reply_state_path) = test_app(false);
+        let mut reply_sender = test_sender();
+        reply_app.sessions.push(test_session(
+            "reply-thread",
+            "Reply target",
+            SessionStatus::Completed,
+        ));
+        reply_app.composer_open = true;
+        reply_app.load_selected_reply_draft();
+        reply_app.insert_text("continue");
+
+        reply_app.submit(&mut reply_sender).expect("submit reply");
+        assert!(!reply_app.composer_open);
+        assert_eq!(reply_app.notice(), "Resuming session…");
+
+        let _ = std::fs::remove_file(new_state_path);
+        let _ = std::fs::remove_file(reply_state_path);
+    }
+
+    #[test]
+    fn paste_collapse_threshold_accepts_long_or_multiline_content() {
+        assert!(!should_collapse_paste(
+            &"x".repeat(LONG_PASTE_CHAR_THRESHOLD - 1)
+        ));
+        assert!(should_collapse_paste(
+            &"x".repeat(LONG_PASTE_CHAR_THRESHOLD)
+        ));
+        assert!(should_collapse_paste(
+            &["line"; LONG_PASTE_LINE_THRESHOLD].join("\n")
+        ));
     }
 
     #[test]
@@ -3347,6 +3795,7 @@ mod tests {
             SessionStatus::Completed,
         ));
         let mut sender = test_sender();
+        app.composer_open = true;
         app.toggle_compose_target();
         app.insert_text("reply for A");
         app.composer.images.push(PathBuf::from("/tmp/a.png"));
@@ -3387,6 +3836,7 @@ mod tests {
             SessionStatus::Completed,
         ));
         let mut sender = test_sender();
+        app.composer_open = true;
         app.insert_text("global new task");
 
         app.toggle_compose_target();
@@ -3501,13 +3951,20 @@ mod tests {
         ));
         app.selected = 0;
 
-        app.scroll_preview(3);
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }));
         assert_eq!(app.scroll_back, 3);
         assert_eq!(app.selected, 0);
-        app.scroll_preview(-2);
-        assert_eq!(app.scroll_back, 1);
-        assert_eq!(app.selected, 0);
-        app.scroll_preview(-10);
+        assert!(app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        }));
         assert_eq!(app.scroll_back, 0);
         assert_eq!(app.selected, 0);
         let _ = std::fs::remove_file(state_path);
@@ -3689,6 +4146,13 @@ mod tests {
         app.handle_response(json!({"id": 1, "result": {}}), &mut sender)
             .expect("handle rename response");
         assert_eq!(app.sessions[0].title, "New name");
+        assert!(!app.composer_open);
+        assert_eq!(app.composer.target, ComposeTarget::NewTask);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("reopen saved reply after rename");
         assert_eq!(app.composer.target, ComposeTarget::Reply);
         assert_eq!(app.composer.text, "saved draft");
         assert_eq!(app.composer.images, vec![PathBuf::from("/tmp/draft.png")]);
@@ -4016,6 +4480,47 @@ mod tests {
             &mut sender,
         )
         .expect("ctrl-c");
+
+        assert!(app.should_quit());
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn question_mark_opens_and_closes_shortcut_help() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("open shortcut help");
+        assert!(app.help_open());
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("ignore navigation while help is open");
+        assert!(app.help_open());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("close shortcut help");
+        assert!(!app.help_open());
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn ctrl_c_closes_codeck_from_shortcut_help() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+        app.help_open = true;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut sender,
+        )
+        .expect("ctrl-c from shortcut help");
 
         assert!(app.should_quit());
         let _ = std::fs::remove_file(state_path);

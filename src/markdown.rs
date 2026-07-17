@@ -34,13 +34,43 @@ impl StyledLine {
         }
     }
 
-    pub fn to_ratatui(&self) -> Line<'static> {
-        Line::from(
-            self.spans
-                .iter()
-                .map(|span| Span::styled(span.text.clone(), span.style))
-                .collect::<Vec<_>>(),
-        )
+    pub fn to_ratatui_with_selection(
+        &self,
+        selection: Option<(usize, usize)>,
+        selection_background: Color,
+    ) -> Line<'static> {
+        let mut rendered = Vec::<Span<'static>>::new();
+        let mut column = 0;
+        for span in &self.spans {
+            let mut segment = String::new();
+            let mut segment_style = None;
+            for grapheme in span.text.graphemes(true) {
+                let next = column + UnicodeWidthStr::width(grapheme).max(1);
+                let selected = selection.is_some_and(|(start, end)| column < end && next > start);
+                let style = if selected {
+                    span.style.bg(selection_background)
+                } else {
+                    span.style
+                };
+                if segment_style.is_some_and(|current| current != style) {
+                    rendered.push(Span::styled(
+                        std::mem::take(&mut segment),
+                        segment_style.unwrap(),
+                    ));
+                }
+                segment_style = Some(style);
+                segment.push_str(grapheme);
+                column = next;
+            }
+            if let Some(style) = segment_style {
+                rendered.push(Span::styled(segment, style));
+            }
+        }
+        Line::from(rendered)
+    }
+
+    pub fn plain_text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
     fn width(&self) -> usize {
@@ -560,7 +590,7 @@ fn render_table(table: TableState, width: usize) -> Vec<StyledLine> {
 }
 
 fn table_record_trigger_width(width: usize) -> usize {
-    width.min(TABLE_RECORD_READABLE_WIDTH).max(1)
+    width.clamp(1, TABLE_RECORD_READABLE_WIDTH)
 }
 
 fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
@@ -569,13 +599,13 @@ fn compact_table_lines(table: &TableState) -> Vec<StyledLine> {
     let mut output = Vec::new();
     for row in &table.rows {
         let mut line = StyledLine::default();
-        for index in 0..column_count {
+        for (index, &column_width) in column_widths.iter().enumerate().take(column_count) {
             if index > 0 {
                 line.push(" │ ", Style::default().fg(Color::DarkGray), None);
             }
             let cell = row.cells.get(index);
             let cell_width = cell.map(StyledLine::width).unwrap_or_default();
-            let padding = column_widths[index].saturating_sub(cell_width);
+            let padding = column_width.saturating_sub(cell_width);
             let alignment = table
                 .alignments
                 .get(index)
@@ -723,7 +753,7 @@ fn record_table_lines(table: &TableState, width: usize) -> Vec<StyledLine> {
 
 fn table_separator(width: usize) -> StyledLine {
     StyledLine::from_span(
-        "─".repeat(width.min(80).max(1)),
+        "─".repeat(width.clamp(1, 80)),
         Style::default().fg(Color::DarkGray),
     )
 }
@@ -946,6 +976,67 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.text.contains("site") && span.link.as_deref() == Some("https://example.com")
         }));
+    }
+
+    #[test]
+    fn selection_highlight_preserves_styles_and_wide_grapheme_boundaries() {
+        let line = StyledLine {
+            spans: vec![
+                StyledSpan {
+                    text: "你".to_string(),
+                    style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    link: None,
+                },
+                StyledSpan {
+                    text: "ab".to_string(),
+                    style: Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::ITALIC),
+                    link: None,
+                },
+            ],
+        };
+
+        let selection_background = Color::Rgb(204, 230, 204);
+        let rendered = line.to_ratatui_with_selection(Some((1, 3)), selection_background);
+        assert_eq!(rendered.spans[0].content.as_ref(), "你");
+        assert_eq!(rendered.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(rendered.spans[0].style.bg, Some(selection_background));
+        assert!(
+            rendered.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            !rendered.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(rendered.spans[1].content.as_ref(), "a");
+        assert_eq!(rendered.spans[1].style.fg, Some(Color::Blue));
+        assert_eq!(rendered.spans[1].style.bg, Some(selection_background));
+        assert!(
+            rendered.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            !rendered.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(rendered.spans[2].content.as_ref(), "b");
+        assert_eq!(rendered.spans[2].style.bg, None);
+        assert!(
+            !rendered.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -1174,8 +1265,8 @@ mod tests {
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert!(!highlighted.iter().any(|text| *text == "https:"));
-        assert!(!highlighted.iter().any(|text| *text == "公司："));
+        assert!(!highlighted.contains(&"https:"));
+        assert!(!highlighted.contains(&"公司："));
         let rendered = lines.iter().map(plain_text).collect::<Vec<_>>();
         assert!(rendered.iter().any(|line| line.contains("| 公司 | 代码 |")));
         assert!(rendered.iter().any(|line| line.contains("口径 | Taiwan")));
@@ -1189,7 +1280,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 1)).expect("terminal");
         terminal
             .draw(|frame| {
-                let rendered = lines.iter().map(StyledLine::to_ratatui).collect::<Vec<_>>();
+                let rendered = lines
+                    .iter()
+                    .map(|line| line.to_ratatui_with_selection(None, Color::Reset))
+                    .collect::<Vec<_>>();
                 frame.render_widget(Paragraph::new(rendered), frame.area());
                 apply_osc8_links(frame, frame.area(), &lines);
             })
@@ -1206,7 +1300,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(20, 1)).expect("terminal");
         terminal
             .draw(|frame| {
-                let rendered = lines.iter().map(StyledLine::to_ratatui).collect::<Vec<_>>();
+                let rendered = lines
+                    .iter()
+                    .map(|line| line.to_ratatui_with_selection(None, Color::Reset))
+                    .collect::<Vec<_>>();
                 frame.render_widget(Paragraph::new(rendered), frame.area());
                 apply_osc8_links(frame, frame.area(), &lines);
             })

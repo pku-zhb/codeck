@@ -2,6 +2,7 @@ use ratatui::style::Color;
 
 const QUERY_TIMEOUT_MS: u64 = 100;
 const TINT_PERCENT: u16 = 20;
+const SELECTION_ANSI_INDEX: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Rgb {
@@ -37,6 +38,10 @@ impl TerminalPalette {
             .zip(self.ansi.get(index as usize).copied().flatten())
             .map(|(background, accent)| blend(background, accent, TINT_PERCENT))
             .map_or(Color::Reset, |color| Color::Rgb(color.r, color.g, color.b))
+    }
+
+    pub fn selection_background(&self) -> Color {
+        self.tinted_ansi(SELECTION_ANSI_INDEX)
     }
 }
 
@@ -139,5 +144,20 @@ mod tests {
     #[test]
     fn missing_terminal_response_falls_back_to_default_background() {
         assert_eq!(TerminalPalette::default().tinted_ansi(6), Color::Reset);
+    }
+
+    #[test]
+    fn selection_uses_the_subtle_ansi_green_tint() {
+        let mut palette = TerminalPalette {
+            background: Some(Rgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            }),
+            ..TerminalPalette::default()
+        };
+        palette.ansi[SELECTION_ANSI_INDEX as usize] = Some(Rgb { r: 0, g: 128, b: 0 });
+
+        assert_eq!(palette.selection_background(), Color::Rgb(204, 230, 204));
     }
 }

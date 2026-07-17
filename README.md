@@ -49,7 +49,8 @@ codeck --check
 
 ## Keys
 
-- `Up` / `Down`: select a session
+- `Up` / `Down`: select a session while the composer is closed; once it is open,
+  always move the cursor between visual input rows
 - `Left`, twice consecutively: open the menu on its default `Resume` tab when
   the composer is empty; use `Tab` to switch to `Settings`
 - In `Resume`: type to filter historical sessions, choose with `Up` / `Down`, and
@@ -59,10 +60,17 @@ codeck --check
   `Enter`
 - `Right`, twice consecutively: attach the selected session in the native Codex
   TUI when the composer is empty; holding the key does not confirm attach
-- `Tab`: switch the composer between a new task and a reply
+- `Space`: open the hidden composer on the selected session's reply; when the
+  active draft is empty, `Space` closes it again
+- `Esc`: close the composer without discarding its drafts
+- `?`: open the full shortcut reference while the composer is closed
+- `Tab`: while the composer is open, switch between a new task and a reply
+- `Enter`: send the active Reply or New task, then hide the composer
 - `$`: open the Codex skill picker; keep typing to filter, choose with `Up` /
   `Down`, and insert with `Enter` or `Tab`; confirmed skills become colored,
   atomic `$skill-name` tokens
+- Long bracketed pastes collapse into an atomic `[Pasted text #N …]` token;
+  Codeck expands the original text when the prompt is submitted
 - `Ctrl+N`: compose a new task
 - `Ctrl+V` (or `Cmd+V` when the terminal forwards it): attach an image from the
   system clipboard; pasting one or more image file paths also attaches them
@@ -76,6 +84,9 @@ codeck --check
 - `PageUp` / `PageDown`: scroll the shared thinking/final stream
 - Mouse wheel: scroll only the conversation preview; it never changes the
   selected session in the picker
+- Mouse drag in the preview: select rendered text and copy it to the system
+  clipboard on release; hold the terminal's mouse-bypass modifier (`Option` in
+  Termy/iTerm2, commonly `Shift` elsewhere) for native terminal selection
 - `Ctrl+C`: close the dashboard; running tasks continue
 
 Attached images are inserted at the current cursor as colored `[Image #N]`
@@ -86,11 +97,11 @@ the whole token, while adjacent `Backspace` or `Delete` removes it in one step.
 Image-only prompts are supported.
 
 Drafts are isolated by intent: `New` has one global draft, while `Reply` keeps a
-separate in-memory draft for every session. Moving with `Up` / `Down` saves and
-restores the corresponding reply text, cursor, and image attachments, so a
-half-written reply cannot be sent to the newly selected session.
-The composer's status and shortcut hint starts on the line below the cursor,
-wraps to the available terminal width, and remains visible while typing.
+separate in-memory draft for every session. Closing with `Esc` preserves the
+active text, cursor, and image attachments. The composer is hidden in navigation
+mode, so `Up` / `Down` cannot accidentally switch sessions until editing ends.
+The grey footer is rendered separately from the composer and shows only the
+most common shortcuts. Press `?` from navigation mode for the full reference.
 
 The skill picker uses Codex app-server's `skills/list` result for the active
 working directory. Selected skills are sent as native structured `skill` input

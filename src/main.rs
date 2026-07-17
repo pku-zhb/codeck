@@ -4,6 +4,7 @@ mod clipboard;
 mod lifecycle;
 mod markdown;
 mod model;
+mod selection;
 mod terminal_palette;
 mod transcript;
 mod ui;
@@ -18,7 +19,10 @@ use app::{App, AttachRequest};
 use clap::Parser;
 use client::CodexClient;
 use crossterm::cursor::Show;
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, MouseEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -98,8 +102,13 @@ fn run_tui(mut app: App, mut client: CodexClient) -> Result<()> {
     enable_raw_mode().context("enable terminal raw mode")?;
     let palette = terminal_palette::TerminalPalette::probe();
     let mut output = stdout();
-    execute!(output, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter terminal screen")?;
+    execute!(
+        output,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .context("enter terminal screen")?;
 
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
@@ -143,18 +152,20 @@ fn run_event_loop(
         }
 
         if event::poll(Duration::from_millis(100)).context("poll terminal event")? {
-            match event::read().context("read terminal event")? {
-                Event::Key(key) => app.handle_key(key, client)?,
-                Event::Paste(text) => app.insert_paste(&text),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_preview(3),
-                    MouseEventKind::ScrollDown => app.scroll_preview(-3),
-                    _ => {}
-                },
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-            needs_draw = true;
+            let event_needs_draw = match event::read().context("read terminal event")? {
+                Event::Key(key) => {
+                    app.handle_key(key, client)?;
+                    true
+                }
+                Event::Paste(text) => {
+                    app.insert_paste(&text);
+                    true
+                }
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Resize(_, _) => true,
+                _ => false,
+            };
+            needs_draw |= event_needs_draw;
         }
     }
     Ok(())
@@ -188,6 +199,7 @@ fn reenter_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
+        EnableMouseCapture,
         EnableBracketedPaste
     )
     .context("re-enter terminal screen")?;
@@ -205,6 +217,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     )
@@ -217,7 +230,13 @@ fn install_panic_restore_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+        let _ = execute!(
+            stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
         original(info);
     }));
 }

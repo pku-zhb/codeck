@@ -1,4 +1,7 @@
+use std::num::NonZeroU16;
+
 use ratatui::Frame;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -17,9 +20,16 @@ use crate::terminal_palette::TerminalPalette;
 pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
+        app.clear_preview_surface();
+        return;
+    }
+    if app.help_open() {
+        app.clear_preview_surface();
+        render_help(frame, area);
         return;
     }
     if app.settings_open() {
+        app.clear_preview_surface();
         render_menu(
             frame,
             area,
@@ -36,25 +46,33 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
         .map(|picker| (picker.items.len().clamp(1, 6) + 1) as u16)
         .unwrap_or_default();
     let separator_height = u16::from(area.height >= 6);
+    let footer = footer_lines(app, area.width as usize);
+    let footer_height = (footer.len().min(3) as u16).min(area.height.saturating_sub(1));
     let max_input_height = area
         .height
         .saturating_sub(separator_height.saturating_mul(2))
+        .saturating_sub(footer_height)
         .saturating_sub(2)
         .max(1);
     let input_prefix = composer_prefix(app.composer().target, app.selected_has_pending_request());
-    let hint = composer_hint(app);
-    let input_height = composer_panel_height(
-        &input_prefix,
-        &app.composer().text,
-        &hint,
-        area.width as usize,
-        max_input_height,
-    );
+    let input_height = if app.composer_open() {
+        composer_box_height(
+            &input_prefix,
+            &app.composer().text,
+            area.width as usize,
+            max_input_height,
+        )
+    } else {
+        0
+    };
+    let composer_separator_height = separator_height * u16::from(app.composer_open());
     let available = area
         .height
         .saturating_sub(input_height)
         .saturating_sub(skill_picker_height)
-        .saturating_sub(separator_height.saturating_mul(2));
+        .saturating_sub(footer_height)
+        .saturating_sub(separator_height)
+        .saturating_sub(composer_separator_height);
     let max_sessions = (available / 3).max(1);
     let desired_sessions = app.sessions().len() as u16;
     let session_height = desired_sessions.min(max_sessions).min(available);
@@ -63,19 +81,23 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
         Constraint::Length(separator_height),
         Constraint::Min(0),
         Constraint::Length(skill_picker_height),
-        Constraint::Length(separator_height),
+        Constraint::Length(composer_separator_height),
         Constraint::Length(input_height),
+        Constraint::Length(footer_height),
     ])
     .split(area);
 
     render_sessions(frame, chunks[0], app);
     render_separator(frame, chunks[1]);
-    render_messages(frame, chunks[2], app);
+    render_messages(frame, chunks[2], app, palette);
     if let Some(picker) = &skill_picker {
         render_skill_picker(frame, chunks[3], picker);
     }
-    render_separator(frame, chunks[4]);
-    render_composer(frame, chunks[5], app, palette);
+    if app.composer_open() {
+        render_separator(frame, chunks[4]);
+        render_composer(frame, chunks[5], app, palette);
+    }
+    render_footer(frame, chunks[6], &footer);
 }
 
 fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerView) {
@@ -128,6 +150,57 @@ fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerVi
             ]));
         }
     }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn render_help(frame: &mut Frame<'_>, area: Rect) {
+    let heading = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled("  Codeck shortcuts", heading)),
+        Line::default(),
+    ];
+    for (shortcut, description) in [
+        ("Navigation", ""),
+        ("Space", "open composer"),
+        ("↑ / ↓", "select session"),
+        ("← ← / → →", "menu / attach Codex"),
+        ("Wheel / PgUp/Dn", "scroll preview"),
+        ("", ""),
+        ("Editing", ""),
+        ("Tab", "switch Reply / New task"),
+        ("↑ / ↓", "move between visual rows"),
+        ("Enter / Shift+Enter", "send / newline"),
+        ("$", "open skills"),
+        ("Ctrl+V / Ctrl+U", "image / clear"),
+        ("Esc / empty Space", "close; keep draft"),
+        ("", ""),
+        ("Sessions", ""),
+        ("Ctrl+T / Ctrl+R", "pin / rename"),
+        ("Ctrl+X twice", "pause / remove"),
+        ("Mouse drag", "copy preview text"),
+        ("Ctrl+C", "close Codeck"),
+    ] {
+        if description.is_empty() {
+            lines.push(if shortcut.is_empty() {
+                Line::default()
+            } else {
+                Line::from(Span::styled(format!("  {shortcut}"), heading))
+            });
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {shortcut:<18}"), key),
+                Span::raw(description),
+            ]));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("  ? / Esc close help", dim)));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -417,8 +490,9 @@ fn session_line(
     .style(row_style)
 }
 
-fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: &TerminalPalette) {
     if area.height == 0 || area.width == 0 {
+        app.clear_preview_surface();
         return;
     }
     app.set_message_view_height(area.height as usize);
@@ -454,12 +528,35 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let start = max_start.saturating_sub(scroll_back);
     let end = (start + viewport).min(lines.len());
     let visible = &lines[start..end];
+    app.set_preview_surface(area, visible.iter().map(StyledLine::plain_text).collect());
+    let selection_background = palette.selection_background();
     let rendered = visible
         .iter()
-        .map(StyledLine::to_ratatui)
+        .enumerate()
+        .map(|(row, line)| {
+            line.to_ratatui_with_selection(app.preview_selection_range(row), selection_background)
+        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(rendered)), area);
+    apply_preview_emoji_widths(frame, area, visible);
     apply_osc8_links(frame, area, visible);
+}
+
+fn apply_preview_emoji_widths(frame: &mut Frame<'_>, area: Rect, lines: &[StyledLine]) {
+    const EMOJI_GUTTERS: [&str; 5] = ["🎯", "🧠", "💬", "✅", "❓"];
+    let width = NonZeroU16::new(2).expect("emoji width");
+    for (row, line) in lines.iter().take(area.height as usize).enumerate() {
+        let Some(gutter) = line.spans.first().map(|span| span.text.as_str()) else {
+            continue;
+        };
+        if !EMOJI_GUTTERS.iter().any(|emoji| gutter.starts_with(emoji)) {
+            continue;
+        }
+        let position = (area.x, area.y.saturating_add(row as u16));
+        if let Some(cell) = frame.buffer_mut().cell_mut(position) {
+            cell.set_diff_option(CellDiffOption::ForcedWidth(width));
+        }
+    }
 }
 
 fn message_lines(
@@ -502,7 +599,7 @@ fn message_lines(
 fn message_style(kind: MessageKind) -> (&'static str, Style, Style) {
     match kind {
         MessageKind::User => (
-            "› ",
+            "🎯 ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -528,12 +625,16 @@ fn message_style(kind: MessageKind) -> (&'static str, Style, Style) {
     }
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &TerminalPalette) {
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &mut App, palette: &TerminalPalette) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let pending = app.selected_has_pending_request();
     let prefix = composer_prefix(app.composer().target, pending);
+    app.set_composer_layout(
+        area.width.max(1) as usize,
+        UnicodeWidthStr::width(prefix.as_str()),
+    );
     let accent = composer_accent(app.composer().target, pending);
     let background = composer_background(app.composer().target, pending, palette);
     let prefix_style = Style::default()
@@ -548,29 +649,36 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Termi
         prefix_style,
         area.width.max(1) as usize,
     );
-    let hint = composer_hint(app);
-    let hint_height = (wrapped_hint_lines(&hint, area.width as usize).len() as u16)
-        .min(area.height.saturating_sub(1));
-    let editor_height = area.height.saturating_sub(hint_height).max(1);
+    let title_height = u16::from(area.height > 1);
+    let editor_height = area.height.saturating_sub(title_height).max(1);
     let chunks = Layout::vertical([
-        Constraint::Length(u16::from(editor_height > 1)),
-        Constraint::Length(editor_height.saturating_sub(u16::from(editor_height > 1))),
-        Constraint::Length(hint_height),
+        Constraint::Length(title_height),
+        Constraint::Length(editor_height),
     ])
     .split(area);
     let title_area = chunks[0];
     let editor_area = chunks[1];
-    let hint_area = chunks[2];
     let offset = cursor_row.saturating_sub(editor_area.height.saturating_sub(1) as usize);
 
     if title_area.height > 0 {
-        let title = composer_context_title(app, title_area.width as usize);
+        let (working, title) = composer_context_title(
+            app.composer().target,
+            app.selected_session(),
+            title_area.width as usize,
+        );
+        let mut spans = vec![Span::styled("  ", Style::default().bg(background))];
+        if working {
+            spans.push(Span::styled(
+                "● ",
+                Style::default().fg(Color::Green).bg(background),
+            ));
+        }
+        spans.push(Span::styled(
+            title,
+            Style::default().fg(accent).bg(background),
+        ));
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("  ", Style::default().bg(background)),
-                Span::styled(title, Style::default().fg(accent).bg(background)),
-            ]))
-            .style(Style::default().bg(background)),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(background)),
             title_area,
         );
     }
@@ -588,14 +696,6 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, palette: &Termi
         Paragraph::new(Text::from(visible)).style(Style::default().bg(background)),
         editor_area,
     );
-    if hint_area.height > 0 {
-        let hint_lines = wrapped_hint_lines(&hint, hint_area.width as usize)
-            .into_iter()
-            .take(hint_area.height as usize)
-            .map(|line| Line::from(Span::styled(line, dim_style())))
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(hint_lines)), hint_area);
-    }
     let cursor_y = editor_area
         .y
         .saturating_add(cursor_row.saturating_sub(offset) as u16)
@@ -629,19 +729,31 @@ fn composer_ansi_index(target: ComposeTarget, pending: bool) -> u8 {
     }
 }
 
-fn composer_context_title(app: &App, width: usize) -> String {
-    let label = match app.composer().target {
+fn composer_context_title(
+    target: ComposeTarget,
+    session: Option<&crate::model::Session>,
+    width: usize,
+) -> (bool, String) {
+    let working = target == ComposeTarget::Reply
+        && session.is_some_and(|session| session.status == SessionStatus::Working);
+    let label = match target {
         ComposeTarget::NewTask => "New task".to_string(),
-        ComposeTarget::Reply => app
-            .selected_session()
+        ComposeTarget::Reply => session
             .map(|session| session.title.clone())
             .unwrap_or_else(|| "No session selected".to_string()),
-        ComposeTarget::Rename => app
-            .selected_session()
+        ComposeTarget::Rename => session
             .map(|session| format!("Rename: {}", session.title))
             .unwrap_or_else(|| "Rename".to_string()),
     };
-    truncate_display(&label, width.saturating_sub(2))
+    let lamp_width = if working {
+        UnicodeWidthStr::width("● ")
+    } else {
+        0
+    };
+    (
+        working,
+        truncate_display(&label, width.saturating_sub(2).saturating_sub(lamp_width)),
+    )
 }
 
 fn line_with_bg(mut line: Line<'static>, background: Color) -> Line<'static> {
@@ -668,16 +780,11 @@ fn composer_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 
     (lines.len().min(u16::MAX as usize) as u16).clamp(1, maximum.max(1))
 }
 
-fn composer_panel_height(prefix: &str, text: &str, hint: &str, width: usize, maximum: u16) -> u16 {
+fn composer_box_height(prefix: &str, text: &str, width: usize, maximum: u16) -> u16 {
     let maximum = maximum.max(1);
-    let hint_height = wrapped_hint_lines(hint, width)
-        .len()
-        .min(maximum.saturating_sub(1) as usize) as u16;
-    let editor_height = composer_height(prefix, text, width, maximum - hint_height);
-    editor_height
-        .saturating_add(hint_height)
-        .saturating_add(1)
-        .min(maximum)
+    let title_height = u16::from(maximum > 1);
+    let editor_height = composer_height(prefix, text, width, maximum - title_height);
+    editor_height.saturating_add(title_height).min(maximum)
 }
 
 fn wrapped_hint_lines(hint: &str, width: usize) -> Vec<String> {
@@ -688,13 +795,37 @@ fn wrapped_hint_lines(hint: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn composer_hint(app: &App) -> String {
-    let base = "$ skills · ←← menu · →→ attach · ↑↓ select · Ctrl+V image · Ctrl+T pin · Ctrl+R rename · Ctrl+X pause/remove · Ctrl+C close";
-    if app.notice().is_empty() {
-        format!("  {base}")
-    } else {
-        format!("  {} · {}", app.notice(), base)
+fn footer_lines(app: &App, width: usize) -> Vec<String> {
+    let mut sections = Vec::new();
+    if !app.notice().is_empty() {
+        sections.push(app.notice().to_string());
     }
+    if app.composer_open() {
+        let hint = if app.composer().target == ComposeTarget::Rename {
+            "Enter save · Esc cancel"
+        } else {
+            "Tab switch · Enter send · Esc close"
+        };
+        sections.push(hint.to_string());
+    } else {
+        sections.push("Space compose · ↑↓ select · ? help".to_string());
+    }
+    sections
+        .into_iter()
+        .flat_map(|section| wrapped_hint_lines(&format!("  {section}"), width.max(1)).into_iter())
+        .collect()
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, lines: &[String]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let rendered = lines
+        .iter()
+        .take(area.height as usize)
+        .map(|line| Line::from(Span::styled(line.clone(), dim_style())))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(rendered)), area);
 }
 
 fn layout_with_cursor(text: &str, cursor_byte: usize, width: usize) -> (Vec<String>, usize, usize) {
@@ -802,6 +933,9 @@ fn token_style_at(tokens: &[ComposerToken], byte: usize) -> Option<Style> {
             ComposerTokenKind::Image(_) => Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+            ComposerTokenKind::PastedText(_) => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         })
 }
 
@@ -847,6 +981,7 @@ fn dim_style() -> Style {
 mod tests {
     use super::*;
     use crate::model::Session;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn truncation_respects_cjk_width() {
@@ -870,11 +1005,11 @@ mod tests {
     }
 
     #[test]
-    fn composer_reserves_wrapped_hint_rows_below_the_cursor_while_typing() {
-        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 10), 4);
-        assert_eq!(composer_panel_height("> ", "", "1234567890", 5, 2), 2);
-        assert_eq!(composer_panel_height("> ", "typed", "1234567890", 5, 10), 5);
-        assert_eq!(composer_panel_height("> ", "1234567890", "hint", 5, 3), 3);
+    fn composer_box_reserves_a_title_and_grows_with_wrapped_input() {
+        assert_eq!(composer_box_height("> ", "", 5, 10), 2);
+        assert_eq!(composer_box_height("> ", "", 5, 1), 1);
+        assert_eq!(composer_box_height("> ", "1234567890", 5, 10), 4);
+        assert_eq!(composer_box_height("> ", "1234567890", 5, 3), 3);
     }
 
     #[test]
@@ -898,6 +1033,29 @@ mod tests {
     }
 
     #[test]
+    fn working_reply_context_adds_a_green_lamp() {
+        let session = Session {
+            id: "thread".to_string(),
+            title: "Active research".to_string(),
+            preview: String::new(),
+            cwd: "/tmp/project".to_string(),
+            path: None,
+            updated_at: 0,
+            source: "appServer".to_string(),
+            thread_source: Some("codeck".to_string()),
+            status: SessionStatus::Working,
+            active_turn_id: Some("turn".to_string()),
+            messages: Vec::new(),
+            history_loaded: true,
+        };
+
+        let (working, title) = composer_context_title(ComposeTarget::Reply, Some(&session), 80);
+        assert!(working);
+        assert_eq!(title, "Active research");
+        assert!(!composer_context_title(ComposeTarget::NewTask, Some(&session), 80).0);
+    }
+
+    #[test]
     fn composer_tokens_use_ansi_foreground_without_background() {
         let mut composer = crate::model::Composer::default();
         composer.insert("$doc");
@@ -909,6 +1067,7 @@ mod tests {
             },
         );
         composer.attach_image(std::path::PathBuf::from("/tmp/chart.png"));
+        composer.attach_pasted_text("long pasted content".to_string());
 
         let (lines, _, _) = styled_composer_layout(
             "＋ new › ",
@@ -928,11 +1087,18 @@ mod tests {
             .iter()
             .find(|span| span.content.contains("[Image #1]"))
             .expect("styled image token");
+        let pasted = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("[Pasted text #1"))
+            .expect("styled pasted text token");
 
         assert_eq!(skill.style.fg, Some(Color::Magenta));
         assert_eq!(image.style.fg, Some(Color::Yellow));
+        assert_eq!(pasted.style.fg, Some(Color::Blue));
         assert!(skill.style.bg.is_none());
         assert!(image.style.bg.is_none());
+        assert!(pasted.style.bg.is_none());
     }
 
     #[test]
@@ -1072,6 +1238,46 @@ mod tests {
         assert!(spans.iter().any(|span| {
             span.text.contains("link") && span.link.as_deref() == Some("https://example.com")
         }));
+        assert_eq!(message_style(MessageKind::User).0, "🎯 ");
+    }
+
+    #[test]
+    fn preview_emoji_gutters_force_two_cell_diff_width() {
+        let lines = [
+            "🎯 prompt",
+            "🧠 thinking",
+            "💬 progress",
+            "✅ final",
+            "❓ question",
+        ]
+        .into_iter()
+        .map(|text| StyledLine::from_span(text, Style::default()))
+        .collect::<Vec<_>>();
+        let mut terminal =
+            Terminal::new(TestBackend::new(20, lines.len() as u16)).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let rendered = lines
+                    .iter()
+                    .map(|line| line.to_ratatui_with_selection(None, Color::Reset))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(rendered), frame.area());
+                apply_preview_emoji_widths(frame, frame.area(), &lines);
+            })
+            .expect("render emoji gutters");
+
+        for row in 0..lines.len() as u16 {
+            let cell = terminal
+                .backend()
+                .buffer()
+                .cell((0, row))
+                .expect("emoji cell");
+            assert!(matches!(
+                cell.diff_option,
+                CellDiffOption::ForcedWidth(width) if width.get() == 2
+            ));
+        }
     }
 
     #[test]

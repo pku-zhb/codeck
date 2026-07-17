@@ -6,6 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use arboard::{Clipboard, Error as ClipboardError};
 
+pub fn copy_text(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("open system clipboard")?;
+    clipboard
+        .set_text(text.to_string())
+        .context("copy text to system clipboard")
+}
+
 pub fn save_clipboard_image() -> Result<Option<PathBuf>> {
     let mut clipboard = Clipboard::new().context("open system clipboard")?;
     let image = match clipboard.get_image() {

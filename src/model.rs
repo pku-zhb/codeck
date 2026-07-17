@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionStatus {
@@ -205,6 +206,8 @@ pub struct Composer {
     pub skills: Vec<SkillReference>,
     pub tokens: Vec<ComposerToken>,
     next_image_number: usize,
+    next_paste_number: usize,
+    vertical_column: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +228,7 @@ pub struct ComposerToken {
 pub enum ComposerTokenKind {
     Skill(SkillReference),
     Image(PathBuf),
+    PastedText(String),
 }
 
 impl Default for Composer {
@@ -237,12 +241,15 @@ impl Default for Composer {
             skills: Vec::new(),
             tokens: Vec::new(),
             next_image_number: 1,
+            next_paste_number: 1,
+            vertical_column: None,
         }
     }
 }
 
 impl Composer {
     pub fn insert(&mut self, text: &str) {
+        self.vertical_column = None;
         let position = self.cursor;
         self.shift_tokens_for_insertion(position, text.len());
         self.text.insert_str(position, text);
@@ -250,6 +257,7 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        self.vertical_column = None;
         if self.cursor == 0 {
             return;
         }
@@ -270,6 +278,7 @@ impl Composer {
     }
 
     pub fn delete(&mut self) {
+        self.vertical_column = None;
         if self.cursor >= self.text.len() {
             return;
         }
@@ -290,6 +299,7 @@ impl Composer {
     }
 
     pub fn move_left(&mut self) {
+        self.vertical_column = None;
         if let Some(token) = self.tokens.iter().find(|token| token.end == self.cursor) {
             self.cursor = token.start;
             return;
@@ -302,6 +312,7 @@ impl Composer {
     }
 
     pub fn move_right(&mut self) {
+        self.vertical_column = None;
         if self.cursor >= self.text.len() {
             return;
         }
@@ -317,23 +328,60 @@ impl Composer {
     }
 
     pub fn move_to_start(&mut self) {
+        self.vertical_column = None;
         self.cursor = 0;
     }
 
     pub fn move_to_end(&mut self) {
+        self.vertical_column = None;
         self.cursor = self.text.len();
+    }
+
+    pub fn move_vertical(&mut self, direction: isize, width: usize, prefix_width: usize) -> bool {
+        let positions = self.visual_cursor_positions(width, prefix_width);
+        let Some((_, current_row, current_column)) = positions
+            .iter()
+            .find(|(byte, _, _)| *byte == self.cursor)
+            .copied()
+        else {
+            return false;
+        };
+        let Some(target_row) = current_row.checked_add_signed(direction) else {
+            return false;
+        };
+        let desired_column = self.vertical_column.unwrap_or(current_column);
+        let Some((target, _, _)) = positions
+            .into_iter()
+            .filter(|(_, row, _)| *row == target_row)
+            .min_by_key(|(_, _, column)| column.abs_diff(desired_column))
+        else {
+            return false;
+        };
+        self.cursor = target;
+        self.vertical_column = Some(desired_column);
+        true
     }
 
     pub fn prompt_text(&self) -> String {
         let mut text = self.text.clone();
-        let mut images = self
+        let mut replacements = self
             .tokens
             .iter()
-            .filter(|token| matches!(&token.kind, ComposerTokenKind::Image(_)))
+            .filter(|token| {
+                matches!(
+                    &token.kind,
+                    ComposerTokenKind::Image(_) | ComposerTokenKind::PastedText(_)
+                )
+            })
             .collect::<Vec<_>>();
-        images.sort_by_key(|token| std::cmp::Reverse(token.start));
-        for token in images {
-            text.replace_range(token.start..token.end, "");
+        replacements.sort_by_key(|token| std::cmp::Reverse(token.start));
+        for token in replacements {
+            let replacement = match &token.kind {
+                ComposerTokenKind::Image(_) => "",
+                ComposerTokenKind::PastedText(value) => value,
+                ComposerTokenKind::Skill(_) => continue,
+            };
+            text.replace_range(token.start..token.end, replacement);
         }
         text
     }
@@ -345,6 +393,8 @@ impl Composer {
         self.skills.clear();
         self.tokens.clear();
         self.next_image_number = 1;
+        self.next_paste_number = 1;
+        self.vertical_column = None;
     }
 
     pub fn clear_text_keep_images(&mut self) {
@@ -375,7 +425,33 @@ impl Composer {
         true
     }
 
+    pub fn attach_pasted_text(&mut self, text: String) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let line_count = text.split('\n').count();
+        let detail = if line_count > 1 {
+            format!("{line_count} lines")
+        } else {
+            format!("{} chars", text.chars().count())
+        };
+        let placeholder = format!("[Pasted text #{} +{detail}] ", self.next_paste_number);
+        self.next_paste_number = self.next_paste_number.saturating_add(1);
+        let start = self.cursor;
+        self.insert(&placeholder);
+        let end = self.cursor;
+        self.tokens.push(ComposerToken {
+            start,
+            style_end: end.saturating_sub(1),
+            end,
+            kind: ComposerTokenKind::PastedText(text),
+        });
+        self.tokens.sort_by_key(|token| token.start);
+        true
+    }
+
     pub fn replace_with_skill(&mut self, start: usize, skill: SkillReference) {
+        self.vertical_column = None;
         if start > self.cursor || self.cursor > self.text.len() {
             return;
         }
@@ -397,6 +473,48 @@ impl Composer {
             kind: ComposerTokenKind::Skill(skill),
         });
         self.tokens.sort_by_key(|token| token.start);
+    }
+
+    fn visual_cursor_positions(
+        &self,
+        width: usize,
+        prefix_width: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        let width = width.max(1);
+        let mut positions = Vec::new();
+        let mut row = prefix_width / width;
+        let mut column = prefix_width % width;
+        for (byte, grapheme) in self.text.grapheme_indices(true) {
+            if self.is_cursor_stop(byte) {
+                positions.push((byte, row, column));
+            }
+            if grapheme == "\n" {
+                row += 1;
+                column = 0;
+                continue;
+            }
+            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            if column > 0 && column + grapheme_width > width {
+                row += 1;
+                column = 0;
+            }
+            column += grapheme_width;
+            if column >= width {
+                row += 1;
+                column = 0;
+            }
+        }
+        if self.is_cursor_stop(self.text.len()) {
+            positions.push((self.text.len(), row, column));
+        }
+        positions
+    }
+
+    fn is_cursor_stop(&self, byte: usize) -> bool {
+        !self
+            .tokens
+            .iter()
+            .any(|token| token.start < byte && byte < token.end)
     }
 
     fn shift_tokens_for_insertion(&mut self, position: usize, length: usize) {
@@ -470,6 +588,7 @@ impl Composer {
                     self.skills.retain(|value| value.path != skill.path);
                 }
             }
+            ComposerTokenKind::PastedText(_) => {}
         }
         self.cursor = token.start;
     }
@@ -523,6 +642,17 @@ mod tests {
         composer.move_left();
         composer.delete();
         assert_eq!(composer.text, "你");
+    }
+
+    #[test]
+    fn composer_moves_vertically_across_wrapped_visual_lines() {
+        let mut composer = Composer::default();
+        composer.insert("abcdefghij");
+
+        assert!(composer.move_vertical(-1, 6, 2));
+        assert_eq!(composer.cursor, 4);
+        assert!(composer.move_vertical(1, 6, 2));
+        assert_eq!(composer.cursor, composer.text.len());
     }
 
     #[test]
@@ -580,5 +710,21 @@ mod tests {
         composer.delete();
         assert_eq!(composer.text, "look ");
         assert!(composer.images.is_empty());
+    }
+
+    #[test]
+    fn composer_collapses_pasted_text_but_expands_it_for_the_prompt() {
+        let mut composer = Composer::default();
+        composer.insert("before after");
+        composer.cursor = "before ".len();
+        let pasted = "first line\nsecond line".to_string();
+
+        assert!(composer.attach_pasted_text(pasted.clone()));
+        assert_eq!(composer.text, "before [Pasted text #1 +2 lines] after");
+        assert_eq!(composer.prompt_text(), format!("before {pasted}after"));
+
+        composer.backspace();
+        assert_eq!(composer.text, "before after");
+        assert!(composer.tokens.is_empty());
     }
 }
