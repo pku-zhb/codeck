@@ -475,6 +475,14 @@ impl Composer {
         self.tokens.sort_by_key(|token| token.start);
     }
 
+    pub fn replace_plain_text_before_cursor(&mut self, start: usize, replacement: &str) {
+        self.vertical_column = None;
+        if start > self.cursor || self.cursor > self.text.len() {
+            return;
+        }
+        self.replace_plain_range(start, self.cursor, replacement);
+    }
+
     fn visual_cursor_positions(
         &self,
         width: usize,
@@ -677,6 +685,18 @@ mod tests {
         composer.backspace();
         assert!(composer.text.is_empty());
         assert!(composer.skills.is_empty());
+        assert!(composer.tokens.is_empty());
+    }
+
+    #[test]
+    fn composer_replaces_plain_command_text_before_the_cursor() {
+        let mut composer = Composer::default();
+        composer.insert("/c");
+
+        composer.replace_plain_text_before_cursor(0, "/clear");
+
+        assert_eq!(composer.text, "/clear");
+        assert_eq!(composer.cursor, "/clear".len());
         assert!(composer.tokens.is_empty());
     }
 

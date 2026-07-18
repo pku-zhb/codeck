@@ -38,6 +38,7 @@ enum PendingCall {
     ThreadStart {
         draft: PromptDraft,
     },
+    ThreadClear,
     ThreadResumeForReply {
         thread_id: String,
         draft: PromptDraft,
@@ -126,6 +127,13 @@ struct SkillPicker {
 }
 
 #[derive(Debug, Clone)]
+struct SlashCommandPicker {
+    query_start: usize,
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
 struct HistoryPicker {
     query: String,
     selected: usize,
@@ -164,6 +172,44 @@ pub struct SkillPickerView {
     pub loading: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SlashCommandMetadata {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlashCommandPickerView {
+    pub items: Vec<SlashCommandMetadata>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommandKind {
+    Clear,
+    Fork,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlashCommandSpec {
+    name: &'static str,
+    description: &'static str,
+    kind: SlashCommandKind,
+}
+
+const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "clear",
+        description: "start and focus a blank Codex session",
+        kind: SlashCommandKind::Clear,
+    },
+    SlashCommandSpec {
+        name: "fork",
+        description: "fork the selected session",
+        kind: SlashCommandKind::Fork,
+    },
+];
+
 pub struct App {
     cwd: PathBuf,
     show_all: bool,
@@ -180,6 +226,7 @@ pub struct App {
     skills_by_cwd: HashMap<String, Vec<SkillMetadata>>,
     skills_inflight: BTreeSet<String>,
     skill_picker: Option<SkillPicker>,
+    slash_command_picker: Option<SlashCommandPicker>,
     pending_calls: HashMap<u64, PendingCall>,
     pending_requests: Vec<PendingRequest>,
     queued_replies: HashMap<String, String>,
@@ -235,6 +282,7 @@ impl App {
             skills_by_cwd: HashMap::new(),
             skills_inflight: BTreeSet::new(),
             skill_picker: None,
+            slash_command_picker: None,
             pending_calls: HashMap::new(),
             pending_requests: Vec::new(),
             queued_replies: HashMap::new(),
@@ -367,7 +415,7 @@ impl App {
             return Ok(());
         }
 
-        if self.handle_skill_picker_key(key) {
+        if self.handle_composer_picker_key(key, sender)? {
             return Ok(());
         }
 
@@ -396,7 +444,7 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
-            self.skill_picker = None;
+            self.clear_composer_pickers();
             if self.composer_open {
                 self.paste_clipboard_image();
             } else {
@@ -408,7 +456,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('n') => {
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     self.cancel_rename();
                     self.switch_to_new_draft();
                     self.composer_open = true;
@@ -416,7 +464,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('r') => {
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     self.start_rename();
                     return Ok(());
                 }
@@ -424,33 +472,33 @@ impl App {
                     if self.composer_open && character.eq_ignore_ascii_case(&'a') =>
                 {
                     self.composer.move_to_start();
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     return Ok(());
                 }
                 KeyCode::Char(character)
                     if self.composer_open && character.eq_ignore_ascii_case(&'e') =>
                 {
                     self.composer.move_to_end();
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     return Ok(());
                 }
                 KeyCode::Char('u') if self.composer_open => {
                     self.composer.reset();
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     return Ok(());
                 }
                 KeyCode::Char('v') if self.composer_open => {
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     self.paste_clipboard_image();
                     return Ok(());
                 }
                 KeyCode::Char('t') => {
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     self.toggle_pin_selected()?;
                     return Ok(());
                 }
                 KeyCode::Char(character) if character.eq_ignore_ascii_case(&'x') => {
-                    self.skill_picker = None;
+                    self.clear_composer_pickers();
                     self.confirm_stop_or_remove(key.kind, sender)?;
                     return Ok(());
                 }
@@ -539,9 +587,9 @@ impl App {
             _ => {}
         }
         if self.composer_open {
-            self.sync_skill_picker(sender)?;
+            self.sync_composer_pickers(sender)?;
         } else {
-            self.skill_picker = None;
+            self.clear_composer_pickers();
         }
         Ok(())
     }
@@ -584,7 +632,7 @@ impl App {
 
     pub fn insert_text(&mut self, text: &str) {
         self.attach_right_armed = None;
-        self.skill_picker = None;
+        self.clear_composer_pickers();
         self.composer.insert(text);
     }
 
@@ -602,7 +650,7 @@ impl App {
             self.notice = "Press Space to compose first".to_string();
             return;
         }
-        self.skill_picker = None;
+        self.clear_composer_pickers();
         if text.is_empty() {
             self.paste_clipboard_image();
             return;
@@ -813,6 +861,33 @@ impl App {
         })
     }
 
+    pub fn slash_command_picker_view(&self) -> Option<SlashCommandPickerView> {
+        let picker = self.slash_command_picker.as_ref()?;
+        let mut ranked_items = SLASH_COMMANDS
+            .iter()
+            .filter_map(|command| {
+                slash_command_match_priority(command, &picker.query).map(|priority| {
+                    (
+                        priority,
+                        SlashCommandMetadata {
+                            name: command.name,
+                            description: command.description,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        ranked_items.sort_by_key(|(priority, _)| *priority);
+        let items = ranked_items
+            .into_iter()
+            .map(|(_, command)| command)
+            .collect::<Vec<_>>();
+        Some(SlashCommandPickerView {
+            selected: picker.selected.min(items.len().saturating_sub(1)),
+            items,
+        })
+    }
+
     pub fn history_picker_view(&self) -> Option<HistoryPickerView> {
         if !self.settings_open || self.menu_tab != MenuTab::Resume {
             return None;
@@ -930,6 +1005,22 @@ impl App {
                 self.select_session(&thread_id);
                 self.load_reply_draft(&thread_id);
                 self.start_turn(&thread_id, &draft, sender)?;
+            }
+            PendingCall::ThreadClear => {
+                let thread = result
+                    .get("thread")
+                    .context("thread/start response missing thread")?;
+                let session = Session::from_thread(thread)
+                    .context("thread/start response has invalid thread")?;
+                let thread_id = session.id.clone();
+                self.track_session(&thread_id)?;
+                self.merge_session(session);
+                self.apply_thread_history(&thread_id, thread);
+                self.select_session(&thread_id);
+                self.load_reply_draft(&thread_id);
+                self.composer_open = true;
+                self.scroll_back = 0;
+                self.notice = "New blank session".to_string();
             }
             PendingCall::ThreadResumeForReply { thread_id, draft } => {
                 let thread = result.get("thread").unwrap_or(&Value::Null);
@@ -1325,14 +1416,20 @@ impl App {
             return Ok(());
         }
 
-        if text == "/fork" {
+        if let Some(command) = slash_command_from_text(&text) {
             if !self.composer.images.is_empty() {
-                self.notice = "/fork does not accept attached images".to_string();
+                self.notice = format!(
+                    "/{} does not accept attached images",
+                    slash_command_name(command)
+                );
                 return Ok(());
             }
             self.composer.reset();
             self.cache_current_draft();
-            return self.fork_selected_session(sender);
+            return match command {
+                SlashCommandKind::Clear => self.clear_to_new_session(sender),
+                SlashCommandKind::Fork => self.fork_selected_session(sender),
+            };
         }
 
         if target == ComposeTarget::Reply
@@ -1441,6 +1538,23 @@ impl App {
             },
         );
         self.notice = format!("Forking {title} as {name}…");
+        Ok(())
+    }
+
+    fn clear_to_new_session(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        let id = sender.request(
+            "thread/start",
+            json!({
+                "cwd": self.cwd.to_string_lossy(),
+                "serviceName": "codeck",
+                "threadSource": THREAD_SOURCE,
+                "ephemeral": false
+            }),
+        )?;
+        self.pending_calls.insert(id, PendingCall::ThreadClear);
+        self.composer_open = true;
+        self.scroll_back = 0;
+        self.notice = "Starting new blank session…".to_string();
         Ok(())
     }
 
@@ -1905,6 +2019,77 @@ impl App {
         Ok(())
     }
 
+    fn handle_composer_picker_key(
+        &mut self,
+        key: KeyEvent,
+        sender: &mut impl RpcSender,
+    ) -> Result<bool> {
+        if self.slash_command_picker.is_some() {
+            return self.handle_slash_command_picker_key(key, sender);
+        }
+        Ok(self.handle_skill_picker_key(key))
+    }
+
+    fn handle_slash_command_picker_key(
+        &mut self,
+        key: KeyEvent,
+        sender: &mut impl RpcSender,
+    ) -> Result<bool> {
+        if self.slash_command_picker.is_none() {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.slash_command_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                Ok(true)
+            }
+            KeyCode::Down => {
+                let item_count = self
+                    .slash_command_picker_view()
+                    .map(|view| view.items.len())
+                    .unwrap_or_default();
+                if let Some(picker) = &mut self.slash_command_picker {
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(1)
+                        .min(item_count.saturating_sub(1));
+                }
+                Ok(true)
+            }
+            KeyCode::Enter
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT,
+                ) =>
+            {
+                let exact = self
+                    .slash_command_picker
+                    .as_ref()
+                    .and_then(|picker| slash_command_from_name(&picker.query))
+                    .is_some();
+                let handled = self.accept_selected_slash_command();
+                if !handled {
+                    self.slash_command_picker = None;
+                    return Ok(false);
+                }
+                if exact {
+                    self.submit(sender)?;
+                }
+                Ok(true)
+            }
+            KeyCode::Tab => {
+                self.accept_selected_slash_command();
+                Ok(true)
+            }
+            KeyCode::Esc => {
+                self.slash_command_picker = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn handle_skill_picker_key(&mut self, key: KeyEvent) -> bool {
         if self.skill_picker.is_none() {
             return false;
@@ -1976,7 +2161,52 @@ impl App {
         true
     }
 
-    fn sync_skill_picker(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+    fn accept_selected_slash_command(&mut self) -> bool {
+        let Some(picker) = self.slash_command_picker.clone() else {
+            return false;
+        };
+        let Some(command) = self
+            .slash_command_picker_view()
+            .and_then(|view| view.items.get(view.selected).cloned())
+        else {
+            return false;
+        };
+        self.composer
+            .replace_plain_text_before_cursor(picker.query_start, &format!("/{}", command.name));
+        self.slash_command_picker = None;
+        self.notice = format!("Selected /{} · Enter to run", command.name);
+        true
+    }
+
+    fn sync_composer_pickers(&mut self, sender: &mut impl RpcSender) -> Result<()> {
+        if self.composer.target == ComposeTarget::Rename {
+            self.clear_composer_pickers();
+            return Ok(());
+        }
+        if let Some((query_start, query)) =
+            active_slash_query(&self.composer.text, self.composer.cursor)
+        {
+            self.skill_picker = None;
+            match &mut self.slash_command_picker {
+                Some(picker) if picker.query_start == query_start => {
+                    if picker.query != query {
+                        picker.query = query;
+                        picker.selected = 0;
+                    }
+                }
+                _ => {
+                    self.slash_command_picker = Some(SlashCommandPicker {
+                        query_start,
+                        query,
+                        selected: 0,
+                    });
+                }
+            }
+            self.clamp_slash_command_picker_selection();
+            return Ok(());
+        }
+        self.slash_command_picker = None;
+
         if self.composer.target == ComposeTarget::Rename
             || (self.composer.target == ComposeTarget::Reply
                 && self
@@ -2016,12 +2246,27 @@ impl App {
         Ok(())
     }
 
+    fn clear_composer_pickers(&mut self) {
+        self.skill_picker = None;
+        self.slash_command_picker = None;
+    }
+
     fn clamp_skill_picker_selection(&mut self) {
         let item_count = self
             .skill_picker_view()
             .map(|view| view.items.len())
             .unwrap_or_default();
         if let Some(picker) = &mut self.skill_picker {
+            picker.selected = picker.selected.min(item_count.saturating_sub(1));
+        }
+    }
+
+    fn clamp_slash_command_picker_selection(&mut self) {
+        let item_count = self
+            .slash_command_picker_view()
+            .map(|view| view.items.len())
+            .unwrap_or_default();
+        if let Some(picker) = &mut self.slash_command_picker {
             picker.selected = picker.selected.min(item_count.saturating_sub(1));
         }
     }
@@ -2258,13 +2503,13 @@ impl App {
         }
         self.switch_to_new_draft();
         self.composer_open = false;
-        self.skill_picker = None;
+        self.clear_composer_pickers();
         self.notice.clear();
     }
 
     fn hide_composer_after_submit(&mut self) {
         self.composer_open = false;
-        self.skill_picker = None;
+        self.clear_composer_pickers();
     }
 
     fn cache_current_draft(&mut self) {
@@ -2573,6 +2818,31 @@ fn active_skill_query(text: &str, cursor: usize) -> Option<(usize, String)> {
     Some((start, query.to_string()))
 }
 
+fn active_slash_query(text: &str, cursor: usize) -> Option<(usize, String)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    if text[cursor..]
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    let prefix = &text[..cursor];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    if !prefix[..start].trim().is_empty() {
+        return None;
+    }
+    let query = prefix.get(start..)?.strip_prefix('/')?;
+    Some((start, query.to_string()))
+}
+
 fn skill_match_priority(skill: &SkillMetadata, query: &str) -> Option<u8> {
     if query.is_empty() {
         return Some(0);
@@ -2590,6 +2860,48 @@ fn skill_match_priority(skill: &SkillMetadata, query: &str) -> Option<u8> {
     } else {
         None
     }
+}
+
+fn slash_command_match_priority(command: &SlashCommandSpec, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = query.to_ascii_lowercase();
+    let name = command.name.to_ascii_lowercase();
+    if name == query {
+        Some(0)
+    } else if name.starts_with(&query) {
+        Some(1)
+    } else if name.contains(&query) {
+        Some(2)
+    } else if command.description.to_ascii_lowercase().contains(&query) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn slash_command_from_name(name: &str) -> Option<SlashCommandKind> {
+    SLASH_COMMANDS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+        .map(|command| command.kind)
+}
+
+fn slash_command_name(kind: SlashCommandKind) -> &'static str {
+    SLASH_COMMANDS
+        .iter()
+        .find(|command| command.kind == kind)
+        .map(|command| command.name)
+        .unwrap_or("command")
+}
+
+fn slash_command_from_text(text: &str) -> Option<SlashCommandKind> {
+    let command = text.strip_prefix('/')?;
+    if command.chars().any(char::is_whitespace) {
+        return None;
+    }
+    slash_command_from_name(command)
 }
 
 fn should_collapse_paste(text: &str) -> bool {
@@ -3658,6 +3970,65 @@ mod tests {
     }
 
     #[test]
+    fn slash_query_requires_a_leading_command_and_filters_commands() {
+        assert_eq!(active_slash_query("/cle", 4), Some((0, "cle".to_string())));
+        assert_eq!(
+            active_slash_query("  /fork", 7),
+            Some((2, "fork".to_string()))
+        );
+        assert_eq!(active_slash_query("please /clear", 13), None);
+        assert_eq!(active_slash_query("/clear rest", 11), None);
+        assert_eq!(
+            slash_command_match_priority(&SLASH_COMMANDS[0], "clear"),
+            Some(0)
+        );
+        assert_eq!(
+            slash_command_match_priority(&SLASH_COMMANDS[0], "cle"),
+            Some(1)
+        );
+        assert_eq!(
+            slash_command_from_text("/CLEAR"),
+            Some(SlashCommandKind::Clear)
+        );
+        assert_eq!(slash_command_from_text("/clear now"), None);
+    }
+
+    #[test]
+    fn slash_command_picker_inserts_the_selected_command() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+        app.composer_open = true;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("type slash");
+        let view = app
+            .slash_command_picker_view()
+            .expect("slash command picker");
+        assert_eq!(
+            view.items
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            vec!["clear", "fork"]
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("select fork");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut sender)
+            .expect("insert selected command");
+
+        assert_eq!(app.composer.text, "/fork");
+        assert!(app.slash_command_picker_view().is_none());
+        assert!(sender.requests.is_empty());
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn skill_picker_prioritizes_name_matches_over_description_matches() {
         let (mut app, state_path) = test_app(false);
         app.skill_picker = Some(SkillPicker {
@@ -3856,6 +4227,82 @@ mod tests {
 
         app.move_selection(-1, &mut sender).expect("select A");
         assert_eq!(app.composer.text, "reply for A");
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn slash_clear_starts_and_focuses_a_blank_session_without_a_turn() {
+        let (mut app, state_path) = test_app(false);
+        app.sessions.push(test_session(
+            "thread-original",
+            "Original",
+            SessionStatus::Completed,
+        ));
+        app.selected = 0;
+        app.composer_open = true;
+        app.load_selected_reply_draft();
+        let mut sender = test_sender();
+
+        for character in "/clear".chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                &mut sender,
+            )
+            .expect("type clear command");
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut sender,
+        )
+        .expect("run clear command");
+
+        assert_eq!(
+            sender.requests,
+            vec![(
+                "thread/start".to_string(),
+                json!({
+                    "cwd": "/tmp",
+                    "serviceName": "codeck",
+                    "threadSource": THREAD_SOURCE,
+                    "ephemeral": false
+                })
+            )]
+        );
+        assert!(app.composer_open);
+        assert!(app.composer.text.is_empty());
+        assert_eq!(app.notice(), "Starting new blank session…");
+
+        app.handle_response(
+            json!({
+                "id": 1,
+                "result": {
+                    "thread": {
+                        "id": "thread-clear",
+                        "name": "",
+                        "preview": "",
+                        "cwd": "/tmp",
+                        "status": {"type": "idle"},
+                        "source": "appServer",
+                        "threadSource": THREAD_SOURCE,
+                        "turns": []
+                    }
+                }
+            }),
+            &mut sender,
+        )
+        .expect("handle clear response");
+
+        assert_eq!(
+            app.selected_session().expect("blank session").id,
+            "thread-clear"
+        );
+        assert_eq!(
+            app.selected_session().expect("blank session").title,
+            "Untitled session"
+        );
+        assert_eq!(app.composer.target, ComposeTarget::Reply);
+        assert!(app.composer_open);
+        assert_eq!(sender.requests.len(), 1);
         let _ = std::fs::remove_file(state_path);
     }
 

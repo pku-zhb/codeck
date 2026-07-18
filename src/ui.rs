@@ -9,7 +9,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, HistoryPickerView, MenuTab, SkillPickerView};
+use crate::app::{App, HistoryPickerView, MenuTab, SkillPickerView, SlashCommandPickerView};
 use crate::markdown::{StyledLine, StyledSpan, apply_osc8_links, render_markdown};
 use crate::model::{
     ComposeTarget, ComposerToken, ComposerTokenKind, MessageEntry, MessageKind, PreviewVerbosity,
@@ -40,10 +40,16 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
         return;
     }
 
+    let slash_command_picker = app.slash_command_picker_view();
     let skill_picker = app.skill_picker_view();
-    let skill_picker_height = skill_picker
+    let picker_height = slash_command_picker
         .as_ref()
         .map(|picker| (picker.items.len().clamp(1, 6) + 1) as u16)
+        .or_else(|| {
+            skill_picker
+                .as_ref()
+                .map(|picker| (picker.items.len().clamp(1, 6) + 1) as u16)
+        })
         .unwrap_or_default();
     let separator_height = u16::from(area.height >= 6);
     let footer = footer_lines(app, area.width as usize);
@@ -69,7 +75,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
     let available = area
         .height
         .saturating_sub(input_height)
-        .saturating_sub(skill_picker_height)
+        .saturating_sub(picker_height)
         .saturating_sub(footer_height)
         .saturating_sub(separator_height)
         .saturating_sub(composer_separator_height);
@@ -80,7 +86,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
         Constraint::Length(session_height),
         Constraint::Length(separator_height),
         Constraint::Min(0),
-        Constraint::Length(skill_picker_height),
+        Constraint::Length(picker_height),
         Constraint::Length(composer_separator_height),
         Constraint::Length(input_height),
         Constraint::Length(footer_height),
@@ -90,7 +96,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, palette: &TerminalPalette) {
     render_sessions(frame, chunks[0], app);
     render_separator(frame, chunks[1]);
     render_messages(frame, chunks[2], app, palette);
-    if let Some(picker) = &skill_picker {
+    if let Some(picker) = &slash_command_picker {
+        render_slash_command_picker(frame, chunks[3], picker);
+    } else if let Some(picker) = &skill_picker {
         render_skill_picker(frame, chunks[3], picker);
     }
     if app.composer_open() {
@@ -153,6 +161,49 @@ fn render_skill_picker(frame: &mut Frame<'_>, area: Rect, picker: &SkillPickerVi
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
+fn render_slash_command_picker(frame: &mut Frame<'_>, area: Rect, picker: &SlashCommandPickerView) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "/ Commands",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  ↑↓ select · Enter/Tab insert",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
+    if picker.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No matching commands",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let viewport = area.height.saturating_sub(1) as usize;
+        let offset = picker.selected.saturating_add(1).saturating_sub(viewport);
+        for (index, command) in picker.items.iter().enumerate().skip(offset).take(viewport) {
+            let selected = index == picker.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(format!("/{:<24}", command.name), style),
+                Span::styled(command.description, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let heading = Style::default()
         .fg(Color::Cyan)
@@ -176,7 +227,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Tab", "switch Reply / New task"),
         ("↑ / ↓", "move between visual rows"),
         ("Enter / Shift+Enter", "send / newline"),
-        ("$", "open skills"),
+        ("$ / Slash", "skills / commands"),
         ("Ctrl+V / Ctrl+U", "image / clear"),
         ("Esc / empty Space", "close; keep draft"),
         ("", ""),
@@ -804,7 +855,7 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
         let hint = if app.composer().target == ComposeTarget::Rename {
             "Enter save · Esc cancel"
         } else {
-            "Tab switch · Enter send · Esc close"
+            "$ skills · / commands · Tab switch · Enter send · Esc close"
         };
         sections.push(hint.to_string());
     } else {
