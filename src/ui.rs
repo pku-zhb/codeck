@@ -235,7 +235,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         ("Ctrl+T / Ctrl+R", "pin / rename"),
         ("Ctrl+X twice", "pause / remove"),
         ("Mouse drag", "copy preview text"),
-        ("Ctrl+C", "close Codeck"),
+        ("Esc twice", "close Codeck"),
     ] {
         if description.is_empty() {
             lines.push(if shortcut.is_empty() {
@@ -356,7 +356,7 @@ fn render_settings_tab(
         lines.push(Line::default());
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ select · Enter save · Tab switch · ←← close · Ctrl+C close Codeck",
+        "↑↓ select · Enter save · Tab switch · Esc/←← close · Esc twice close Codeck",
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(Text::from(lines.clone())), panel);
@@ -859,7 +859,7 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
         };
         sections.push(hint.to_string());
     } else {
-        sections.push("Space compose · ↑↓ select · ? help".to_string());
+        sections.push("Space compose · ↑↓ select · ? help · Esc twice quit".to_string());
     }
     sections
         .into_iter()

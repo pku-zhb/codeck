@@ -23,6 +23,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const LONG_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const LONG_PASTE_LINE_THRESHOLD: usize = 8;
 const DOUBLE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
+const ATTACH_CONFIRM_NOTICE: &str = "Press → again to attach";
+const SETTINGS_CONFIRM_NOTICE: &str = "Press ← again for settings";
+const QUIT_CONFIRM_NOTICE: &str = "Press Esc again to quit";
 const THREAD_SOURCE: &str = "codeck";
 const LEGACY_THREAD_SOURCE: &str = "codex-deck";
 
@@ -249,6 +252,8 @@ pub struct App {
     menu_tab: MenuTab,
     settings_selection: PreviewVerbosity,
     settings_left_armed: Option<Instant>,
+    esc_quit_armed: Option<Instant>,
+    transient_notice_restore: Option<String>,
     force_full_redraw: bool,
     ctrl_x_armed: Option<CtrlXConfirmation>,
     rename_previous: Option<Composer>,
@@ -305,6 +310,8 @@ impl App {
             menu_tab: MenuTab::Resume,
             settings_selection,
             settings_left_armed: None,
+            esc_quit_armed: None,
+            transient_notice_restore: None,
             force_full_redraw: false,
             ctrl_x_armed: None,
             rename_previous: None,
@@ -342,11 +349,23 @@ impl App {
     }
 
     fn expire_double_confirmations(&mut self) {
-        if !confirmation_recent(self.attach_right_armed) {
-            self.attach_right_armed = None;
+        if self
+            .attach_right_armed
+            .is_some_and(|armed_at| !confirmation_recent(Some(armed_at)))
+        {
+            self.disarm_attach_confirmation();
         }
-        if !confirmation_recent(self.settings_left_armed) {
-            self.settings_left_armed = None;
+        if self
+            .settings_left_armed
+            .is_some_and(|armed_at| !confirmation_recent(Some(armed_at)))
+        {
+            self.disarm_settings_confirmation();
+        }
+        if self
+            .esc_quit_armed
+            .is_some_and(|armed_at| !confirmation_recent(Some(armed_at)))
+        {
+            self.disarm_quit_confirmation();
         }
         if self
             .ctrl_x_armed
@@ -382,11 +401,6 @@ impl App {
         self.preview_selection.clear();
         self.expire_double_confirmations();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key_char_eq(&key, 'c') {
-            self.should_quit = true;
-            return Ok(());
-        }
-
         if self.help_open {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.help_open = false;
@@ -395,6 +409,10 @@ impl App {
             return Ok(());
         }
 
+        let is_plain_esc = key.code == KeyCode::Esc && key.modifiers.is_empty();
+        if !is_plain_esc {
+            self.disarm_quit_confirmation();
+        }
         let is_ctrl_x = key.modifiers.contains(KeyModifiers::CONTROL) && key_char_eq(&key, 'x');
         if !is_ctrl_x {
             self.ctrl_x_armed = None;
@@ -422,6 +440,8 @@ impl App {
         if key.code == KeyCode::Esc {
             if self.composer_open {
                 self.close_composer();
+            } else {
+                self.confirm_quit(key.kind);
             }
             return Ok(());
         }
@@ -432,7 +452,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !attach_right {
-            self.attach_right_armed = None;
+            self.disarm_attach_confirmation();
         }
         let settings_left = key.code == KeyCode::Left
             && !self.composer_open
@@ -440,7 +460,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !settings_left {
-            self.settings_left_armed = None;
+            self.disarm_settings_confirmation();
         }
 
         if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('v') {
@@ -631,7 +651,7 @@ impl App {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        self.attach_right_armed = None;
+        self.disarm_attach_confirmation();
         self.clear_composer_pickers();
         self.composer.insert(text);
     }
@@ -658,7 +678,7 @@ impl App {
         let paths = image_paths_from_paste(text);
         if paths.is_empty() {
             if self.composer.target != ComposeTarget::Rename && should_collapse_paste(text) {
-                self.attach_right_armed = None;
+                self.disarm_attach_confirmation();
                 self.composer.attach_pasted_text(text.to_string());
             } else {
                 self.insert_text(text);
@@ -686,7 +706,7 @@ impl App {
             self.composer.attach_image(path);
         }
         let added = self.composer.images.len().saturating_sub(before);
-        self.attach_right_armed = None;
+        self.disarm_attach_confirmation();
         self.notice = if added == 0 {
             "Image is already attached".to_string()
         } else {
@@ -1968,7 +1988,7 @@ impl App {
     }
 
     fn request_attach(&mut self) -> Result<()> {
-        self.attach_right_armed = None;
+        self.disarm_attach_confirmation();
         let Some((thread_id, cwd)) = self
             .selected_session()
             .map(|session| (session.id.clone(), session.cwd.clone()))
@@ -1994,15 +2014,15 @@ impl App {
             self.request_attach()
         } else {
             self.attach_right_armed = Some(Instant::now());
-            self.notice = "Press → again to attach".to_string();
+            self.set_transient_notice(ATTACH_CONFIRM_NOTICE);
             Ok(())
         }
     }
 
     fn confirm_settings(&mut self) -> Result<()> {
         if confirmation_recent(self.settings_left_armed) {
-            self.settings_left_armed = None;
-            self.attach_right_armed = None;
+            self.disarm_settings_confirmation();
+            self.disarm_attach_confirmation();
             self.settings_selection = self.lifecycle.preview_verbosity();
             self.menu_tab = MenuTab::Resume;
             self.history_picker = Some(HistoryPicker {
@@ -2014,9 +2034,56 @@ impl App {
             self.notice.clear();
         } else {
             self.settings_left_armed = Some(Instant::now());
-            self.notice = "Press ← again for settings".to_string();
+            self.set_transient_notice(SETTINGS_CONFIRM_NOTICE);
         }
         Ok(())
+    }
+
+    fn confirm_quit(&mut self, key_kind: KeyEventKind) {
+        if key_kind == KeyEventKind::Repeat {
+            return;
+        }
+        if confirmation_recent(self.esc_quit_armed) {
+            self.esc_quit_armed = None;
+            self.transient_notice_restore = None;
+            self.should_quit = true;
+        } else {
+            self.esc_quit_armed = Some(Instant::now());
+            self.set_transient_notice(QUIT_CONFIRM_NOTICE);
+        }
+    }
+
+    fn disarm_attach_confirmation(&mut self) {
+        if self.attach_right_armed.take().is_some() {
+            self.restore_transient_notice_if_current(ATTACH_CONFIRM_NOTICE);
+        }
+    }
+
+    fn disarm_settings_confirmation(&mut self) {
+        if self.settings_left_armed.take().is_some() {
+            self.restore_transient_notice_if_current(SETTINGS_CONFIRM_NOTICE);
+        }
+    }
+
+    fn disarm_quit_confirmation(&mut self) {
+        if self.esc_quit_armed.take().is_some() {
+            self.restore_transient_notice_if_current(QUIT_CONFIRM_NOTICE);
+        }
+    }
+
+    fn set_transient_notice(&mut self, notice: &'static str) {
+        if !is_transient_notice(&self.notice) {
+            self.transient_notice_restore = Some(self.notice.clone());
+        }
+        self.notice = notice.to_string();
+    }
+
+    fn restore_transient_notice_if_current(&mut self, notice: &'static str) {
+        if self.notice == notice {
+            self.notice = self.transient_notice_restore.take().unwrap_or_default();
+        } else if !is_transient_notice(&self.notice) {
+            self.transient_notice_restore = None;
+        }
     }
 
     fn handle_composer_picker_key(
@@ -2318,6 +2385,16 @@ impl App {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if !settings_left {
             self.settings_left_armed = None;
+        }
+
+        if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.settings_open = false;
+            self.settings_left_armed = None;
+            self.history_picker = None;
+            self.settings_selection = self.lifecycle.preview_verbosity();
+            self.force_full_redraw = true;
+            self.notice = "Menu closed".to_string();
+            return Ok(());
         }
 
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -3134,6 +3211,13 @@ fn confirmation_recent(armed_at: Option<Instant>) -> bool {
     armed_at.is_some_and(|armed_at| armed_at.elapsed() <= DOUBLE_CONFIRM_TIMEOUT)
 }
 
+fn is_transient_notice(notice: &str) -> bool {
+    matches!(
+        notice,
+        ATTACH_CONFIRM_NOTICE | SETTINGS_CONFIRM_NOTICE | QUIT_CONFIRM_NOTICE
+    )
+}
+
 fn key_char_eq(key: &KeyEvent, expected: char) -> bool {
     matches!(key.code, KeyCode::Char(character) if character.eq_ignore_ascii_case(&expected))
 }
@@ -3527,6 +3611,7 @@ mod tests {
         app.sessions
             .push(test_session("thread-123", "Test", SessionStatus::Completed));
         let mut sender = test_sender();
+        app.notice = "Ready".to_string();
 
         app.handle_key(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -3541,6 +3626,7 @@ mod tests {
         )
         .expect("first right");
         assert!(app.take_attach_request().is_none());
+        assert_eq!(app.notice(), ATTACH_CONFIRM_NOTICE);
         app.handle_key(
             KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat),
             &mut sender,
@@ -3549,12 +3635,15 @@ mod tests {
         assert!(app.take_attach_request().is_none());
         app.attach_right_armed =
             Some(Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1));
+        app.tick(&mut sender).expect("expire right confirmation");
+        assert_eq!(app.notice(), "Ready");
         app.handle_key(
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             &mut sender,
         )
         .expect("expired right re-arms");
         assert!(app.take_attach_request().is_none());
+        assert_eq!(app.notice(), ATTACH_CONFIRM_NOTICE);
 
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -3586,6 +3675,7 @@ mod tests {
     fn settings_requires_two_left_presses_and_persists_preview_verbosity() {
         let (mut app, state_path) = test_app(true);
         let mut sender = test_sender();
+        app.notice = "Ready".to_string();
 
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
@@ -3593,6 +3683,7 @@ mod tests {
         )
         .expect("first left");
         assert!(!app.settings_open());
+        assert_eq!(app.notice(), SETTINGS_CONFIRM_NOTICE);
         app.handle_key(
             KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat),
             &mut sender,
@@ -3601,12 +3692,15 @@ mod tests {
         assert!(!app.settings_open());
         app.settings_left_armed =
             Some(Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1));
+        app.tick(&mut sender).expect("expire left confirmation");
+        assert_eq!(app.notice(), "Ready");
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
             &mut sender,
         )
         .expect("expired left re-arms");
         assert!(!app.settings_open());
+        assert_eq!(app.notice(), SETTINGS_CONFIRM_NOTICE);
         app.handle_key(
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
             &mut sender,
@@ -4918,7 +5012,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_with_uppercase_keycode() {
+    fn ctrl_c_no_longer_quits_codeck() {
         let (mut app, state_path) = test_app(false);
         let mut sender = test_sender();
 
@@ -4928,6 +5022,30 @@ mod tests {
         )
         .expect("ctrl-c");
 
+        assert!(!app.should_quit());
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn esc_twice_quits_codeck_and_timeout_restores_notice() {
+        let (mut app, state_path) = test_app(false);
+        let mut sender = test_sender();
+        app.notice = "Ready".to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("first esc");
+        assert!(!app.should_quit());
+        assert_eq!(app.notice(), QUIT_CONFIRM_NOTICE);
+        app.esc_quit_armed =
+            Some(Instant::now() - DOUBLE_CONFIRM_TIMEOUT - Duration::from_millis(1));
+        app.tick(&mut sender).expect("expire quit confirmation");
+        assert_eq!(app.notice(), "Ready");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("fresh first esc");
+        assert!(!app.should_quit());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut sender)
+            .expect("second esc");
         assert!(app.should_quit());
         let _ = std::fs::remove_file(state_path);
     }
@@ -4958,7 +5076,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_closes_codeck_from_shortcut_help() {
+    fn ctrl_c_does_not_close_codeck_from_shortcut_help() {
         let (mut app, state_path) = test_app(false);
         let mut sender = test_sender();
         app.help_open = true;
@@ -4969,7 +5087,8 @@ mod tests {
         )
         .expect("ctrl-c from shortcut help");
 
-        assert!(app.should_quit());
+        assert!(!app.should_quit());
+        assert!(app.help_open());
         let _ = std::fs::remove_file(state_path);
     }
 
